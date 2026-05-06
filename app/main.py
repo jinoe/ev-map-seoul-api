@@ -31,10 +31,19 @@ app = FastAPI(
     lifespan=lifespan,
 )
 
+# app.add_middleware(
+#     CORSMiddleware,
+#     allow_origins=settings.ALLOWED_ORIGINS,
+#     allow_credentials=True,
+#     allow_methods=["*"],
+#     allow_headers=["*"],
+# )
+
+# 임시로 모든 오리진(도메인) 전면 개방
 app.add_middleware(
     CORSMiddleware,
-    allow_origins=settings.ALLOWED_ORIGINS,
-    allow_credentials=True,
+    allow_origins=["*"],  # 개별 IP 대신 "*"를 넣으면 모든 접속을 허용합니다.
+    allow_credentials=False,  # allow_origins=["*"] 일 때는 파일 보안상 False로 주어야 에러가 안 납니다.
     allow_methods=["*"],
     allow_headers=["*"],
 )
