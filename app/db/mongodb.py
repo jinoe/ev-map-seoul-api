@@ -11,7 +11,7 @@ def get_client() -> MongoClient:
     if _client is None:
         _client = MongoClient(
             settings.mongodb_connection_uri,
-            serverSelectionTimeoutMS=5000,
+            serverSelectionTimeoutMS=10000,
         )
     return _client
 

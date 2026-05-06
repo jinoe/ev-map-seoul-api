@@ -24,7 +24,8 @@ class Settings(BaseSettings):
     def mongodb_connection_uri(self) -> str:
         if self.MONGODB_URI:
             return self.MONGODB_URI
-        host = "localhost" if self.APP_ENV == "server" else "13.125.235.209"
+        # "server" 환경이면 localhost, 그 외(local) 환경도 SSH 터널링을 위해 localhost(127.0.0.1)를 기본으로 사용합니다.
+        host = "localhost" 
         if self.MONGODB_USER and self.MONGODB_PASSWORD:
             return (
                 f"mongodb://{self.MONGODB_USER}:{self.MONGODB_PASSWORD}"
