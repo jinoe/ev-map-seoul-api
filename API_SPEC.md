@@ -7,20 +7,118 @@
 ---
 
 ## 목차
-
 1. [헬스체크](#1-헬스체크)
 2. [충전소 목록 조회](#2-충전소-목록-조회)
 3. [구별 현황 조회](#3-구별-현황-조회)
 4. [전체 통계 조회](#4-전체-통계-조회)
-5. [충전기 조건 검색](#5-충전기-조건-검색)
-6. [검색 필드 레퍼런스](#6-검색-필드-레퍼런스)
-7. [에러 응답](#7-에러-응답)
+5. [상세 통계 및 분석 (신규)](#5-상세-통계-및-분석-신규)
+6. [충전기 조건 검색](#6-충전기-조건-검색)
+7. [검색 필드 레퍼런스](#7-검색-필드-레퍼런스)
+8. [에러 응답](#8-에러-응답)
 
 ---
 
 ## 1. 헬스체크
+...
+---
 
-서버 및 MongoDB 연결 상태를 확인합니다.
+## 5. 상세 통계 및 분석 (신규)
+
+대시보드 및 사이드바용 상세 통계 데이터를 제공합니다.
+
+### 5.1 지역별 상세 개요 (Overview)
+
+특정 지역(구, 동)의 현재 상태 요약과 통계를 반환합니다.
+
+| 항목 | 내용 |
+|------|------|
+| **Method** | `GET` |
+| **Endpoint** | `/api/v1/stats/overview` |
+
+**Query Parameters**
+
+| 파라미터 | 타입 | 설명 |
+|----------|------|------|
+| `gu` | string | 구 이름 필터 (예: `강남구`) |
+| `dong` | string | 동 이름 필터 (예: `역삼동`) |
+| `at` | datetime | 기준 시각 (ISO 8601) |
+
+**Response `200 OK`**
+
+```json
+{
+  "scope": { "gu": "강남구", "dong": null },
+  "updatedAt": "2026-05-06T14:30:00+09:00",
+  "totalChargers": 612,
+  "totalStations": 248,
+  "rapidChargers": 120,
+  "slowChargers": 480,
+  "ultraFastChargers": 12,
+  "availableCount": 184,
+  "chargingCount": 320,
+  "faultCount": 108,
+  "maintenanceCount": 20,
+  "stoppedCount": 45,
+  "communicationErrorCount": 43,
+  "unknownCount": 0,
+  "availabilityRate": 30.06,
+  "avgOutput": 25.5,
+  "maxOutput": 350.0,
+  "longOccupancy": {
+    "count": 5,
+    "thresholdMinutes": 360,
+    "items": [
+      {
+        "statId": "ME200001",
+        "chgerId": "01",
+        "statNm": "강남역 주차장",
+        "addr": "...",
+        "gu": "강남구",
+        "dong": "역삼동",
+        "output": "50",
+        "nowTsdt": "20240320100000",
+        "durationMinutes": 420,
+        "lat": 37.4979,
+        "lng": 127.0276
+      }
+    ]
+  },
+  "statusDistribution": { "사용가능": 184, "충전중": 320, ... },
+  "chargerTypeDistribution": { "완속": 480, "급속": 120, "초급속": 12 },
+  "facilityDistribution": { "공공시설": 100, "아파트": 400, ... }
+}
+```
+
+### 5.2 대시보드 분석 데이터 (Dashboard)
+
+대시보드 차트 구현을 위한 시계열 및 집계 데이터를 반환합니다.
+
+| 항목 | 내용 |
+|------|------|
+| **Method** | `GET` |
+| **Endpoint** | `/api/v1/stats/dashboard` |
+
+### 5.3 자치구 리스트 통계
+
+서울시 전체 자치구별 주요 지표 리스트를 반환합니다.
+
+| 항목 | 내용 |
+|------|------|
+| **Method** | `GET` |
+| **Endpoint** | `/api/v1/stats/districts` |
+
+### 5.4 행정동 리스트 통계
+
+특정 자치구 내 행정동별 통계를 반환합니다.
+
+| 항목 | 내용 |
+|------|------|
+| **Method** | `GET` |
+| **Endpoint** | `/api/v1/stats/districts/{gu}/dongs` |
+
+---
+
+## 6. 충전기 조건 검색
 
 | 항목 | 내용 |
 |------|------|
