@@ -34,7 +34,7 @@ FilterItem = Annotated[
 
 class SearchRequest(BaseModel):
     filters: list[FilterItem] = []
-    limit: int = Field(default=100, le=5000)
+    limit: int = Field(default=80000, le=100000)
     skip: int = Field(default=0, ge=0)
     at: datetime | None = Field(
         default=None,
@@ -47,6 +47,10 @@ class SearchRequest(BaseModel):
             "filters 와 AND 로 결합됩니다. "
             "예: 'stat == 사용가능 AND output >= 50' / '강남역' (충전소명 부분 검색)"
         ),
+    )
+    fields: list[str] | None = Field(
+        default=None,
+        description="반환할 MongoDB 필드명 목록. 미지정 시 전체 필드 반환. 예: ['lat', 'lng', 'raw.zscode']",
     )
 
 
