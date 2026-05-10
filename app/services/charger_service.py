@@ -1,3 +1,5 @@
+import re
+
 from pymongo.database import Database
 
 from app.schemas.charger import (
@@ -10,8 +12,9 @@ from app.schemas.charger import (
 )
 
 STAT_LABELS: dict[str, str] = {
+    "0": "알수없음",
     "1": "통신이상",
-    "2": "충전대기",
+    "2": "사용가능",
     "3": "충전중",
     "4": "운영중지",
     "5": "점검중",
@@ -29,7 +32,7 @@ def _extract_gu(addr: str | None) -> str | None:
 
 
 def _build_status_map(db: Database) -> dict[tuple[str, str], str]:
-    latest = db.charger_status_snapshot.find_one(sort=[("collectedAt", -1)])
+    latest = db.charger_status_snapshot.find_one(sort=[("collectedAtBucket", -1), ("collectedAt", -1)])
     if not latest:
         return {}
     bucket = latest["collectedAtBucket"]
@@ -48,9 +51,9 @@ def get_stations(
     skip: int = 0,
     gu: str | None = None,
 ) -> StationListResponse:
-    query: dict = {}
+    query: dict = {"delYn": {"$ne": "Y"}}
     if gu:
-        query["addr"] = {"$regex": gu}
+        query["addr"] = {"$regex": re.escape(gu)}
 
     status_map = _build_status_map(db)
 
@@ -113,13 +116,13 @@ def get_stations(
 
 
 def get_districts(db: Database) -> DistrictListResponse:
-    latest = db.charger_status_snapshot.find_one(sort=[("collectedAt", -1)])
+    latest = db.charger_status_snapshot.find_one(sort=[("collectedAtBucket", -1), ("collectedAt", -1)])
     updated_at = latest["collectedAtKst"] if latest else None
     status_map = _build_status_map(db)
 
     gu_data: dict[str, dict] = {}
     for doc in db.charger_master.find(
-        {},
+        {"delYn": {"$ne": "Y"}},
         {"statId": 1, "chgerId": 1, "addr": 1, "_id": 0},
     ):
         gu = _extract_gu(doc.get("addr"))

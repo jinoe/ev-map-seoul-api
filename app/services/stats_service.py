@@ -1,19 +1,23 @@
 import re
-from datetime import datetime, timedelta
+from collections import defaultdict
+from datetime import datetime, timedelta, timezone
 from typing import Any, Optional
+
 from pymongo.database import Database
+
 from app.schemas.stats import (
-    StatsSummaryResponse,
-    StatsOverviewResponse,
     DashboardStatsResponse,
     DistrictStatItem,
     DongStatItem,
-    ScopeInfo,
+    LongOccupancyItem,
     LongOccupancyStats,
-    LongOccupancyItem
+    ScopeInfo,
+    StatsOverviewResponse,
+    StatsSummaryResponse,
 )
 
-# Constants for status mapping
+KST = timezone(timedelta(hours=9))
+
 STATUS_MAP = {
     "0": "알수없음",
     "1": "통신이상",
@@ -23,253 +27,308 @@ STATUS_MAP = {
     "5": "점검중",
     "9": "알수없음",
 }
+FAULT_STATUSES = {"1", "4", "5"}
+WEEKDAY_LABELS = ["월", "화", "수", "목", "금", "토", "일"]
+LONG_OCCUPANCY_THRESHOLD_MINUTES = 360
 
-def extract_gu(addr: str, zscode: str = None) -> str:
-    if not addr:
-        return "구 미상"
-    for part in addr.split():
-        if part.endswith("구") and len(part) > 1:
-            return part
-    # Fallback to zscode if needed (implementation depends on actual mapping)
-    return "구 미상"
 
-def extract_dong(addr: str) -> str:
-    if not addr:
-        return "동 미상"
-    
-    # Try to find dong in parentheses like (염창동)
-    match = re.search(r'\(([^)]*[동가])\)', addr)
-    if match:
-        return match.group(1).split(',')[0].strip()
-    
-    # Try to find token ending with 동 or 가
-    for part in addr.split():
-        if (part.endswith("동") or part.endswith("가")) and len(part) > 1:
-            return part
-            
-    return "동 미상"
+def _as_utc_naive(dt: datetime | None) -> datetime | None:
+    """MongoDB에 저장된 UTC datetime과 비교하기 위한 안전 변환."""
+    if dt is None:
+        return None
+    if dt.tzinfo is not None:
+        dt = dt.astimezone(timezone.utc).replace(tzinfo=None)
+    return dt
 
-def safe_float(val: Any) -> float:
+
+def _to_kst(dt: datetime | None) -> datetime | None:
+    if dt is None:
+        return None
+    if dt.tzinfo is None:
+        dt = dt.replace(tzinfo=timezone.utc)
+    return dt.astimezone(KST)
+
+
+def _iso_kst(dt: datetime | None, fallback: str | None = None) -> str | None:
+    if fallback:
+        return fallback
+    kst = _to_kst(dt)
+    return kst.isoformat(timespec="seconds") if kst else None
+
+
+def _normalize_text(value: Any) -> str | None:
+    if value is None:
+        return None
+    text = str(value).strip()
+    return text or None
+
+
+def safe_float(value: Any) -> float:
+    """문자/빈값/단위가 섞인 output 값을 안전하게 float로 변환."""
+    if value is None:
+        return 0.0
+    if isinstance(value, (int, float)):
+        return float(value)
+    text = str(value).strip().replace(",", "")
+    if not text:
+        return 0.0
+    match = re.search(r"-?\d+(?:\.\d+)?", text)
+    if not match:
+        return 0.0
     try:
-        if val is None:
-            return 0.0
-        return float(val)
-    except (ValueError, TypeError):
+        return float(match.group(0))
+    except ValueError:
         return 0.0
 
-def get_latest_bucket(db: Database, at: datetime = None) -> Optional[dict]:
-    query = {}
-    if at:
-        query["collectedAt"] = {"$lte": at.isoformat()}
-    
+
+def extract_gu(addr: str | None, zscode: str | None = None) -> str:
+    if not addr:
+        return "구 미상"
+    for part in str(addr).replace(",", " ").split():
+        if part.endswith("구") and len(part) > 1:
+            return part
+    return "구 미상"
+
+
+def extract_dong(addr: str | None) -> str:
+    """도로명주소/지번주소에서 행정동 또는 법정동으로 보이는 토큰 추출."""
+    if not addr:
+        return "동 미상"
+    text = str(addr)
+
+    # 예: 서울특별시 강남구 테헤란로 123 (역삼동)
+    paren_matches = re.findall(r"\(([^)]*)\)", text)
+    for chunk in paren_matches:
+        for token in re.split(r"[\s,]+", chunk):
+            token = token.strip()
+            if re.search(r"(동|가)$", token) and len(token) > 1:
+                return token
+
+    # 예: 서울특별시 강남구 역삼동 123-4
+    for token in re.split(r"[\s,()]+", text):
+        token = token.strip()
+        if re.search(r"(동|가)$", token) and len(token) > 1:
+            return token
+
+    return "동 미상"
+
+
+def _master_match(gu: str | None = None, dong: str | None = None) -> dict[str, Any]:
+    match: dict[str, Any] = {"delYn": {"$ne": "Y"}}
+    addr_conditions = []
+    if gu:
+        addr_conditions.append({"addr": {"$regex": re.escape(gu.strip())}})
+    if dong:
+        addr_conditions.append({"addr": {"$regex": re.escape(dong.strip())}})
+    if len(addr_conditions) == 1:
+        match.update(addr_conditions[0])
+    elif len(addr_conditions) > 1:
+        match = {"$and": [match, *addr_conditions]}
+    return match
+
+
+def get_latest_bucket(db: Database, at: datetime | None = None) -> Optional[dict]:
+    """기준 시각 이전의 가장 최근 상태 스냅샷 문서 1개를 반환."""
+    query: dict[str, Any] = {}
+    at_utc = _as_utc_naive(at)
+    if at_utc:
+        query["collectedAtBucket"] = {"$lte": at_utc}
+
     latest = db.charger_status_snapshot.find_one(
         query,
-        sort=[("collectedAt", -1)]
+        sort=[("collectedAtBucket", -1), ("collectedAt", -1)],
     )
+    if latest is None and at_utc:
+        # 과거 데이터에 collectedAtBucket이 없거나 타입이 섞인 경우를 위한 폴백
+        latest = db.charger_status_snapshot.find_one(
+            {"collectedAt": {"$lte": at_utc}},
+            sort=[("collectedAt", -1)],
+        )
     return latest
 
-def get_stats_summary(db: Database) -> Optional[StatsSummaryResponse]:
-    latest = get_latest_bucket(db)
-    if not latest:
-        return None
-    
-    bucket = latest["collectedAtBucket"]
-    
-    # Simple count from snapshot
-    pipeline = [
-        {"$match": {"collectedAtBucket": bucket}},
-        {"$group": {
-            "_id": "$stat",
-            "count": {"$sum": 1}
-        }}
-    ]
-    status_counts_raw = {doc["_id"]: doc["count"] for doc in db.charger_status_snapshot.aggregate(pipeline)}
-    
-    total_chargers = sum(status_counts_raw.values())
-    available_count = status_counts_raw.get("2", 0)
-    charging_count = status_counts_raw.get("3", 0)
-    fault_count = status_counts_raw.get("1", 0) + status_counts_raw.get("4", 0) + status_counts_raw.get("5", 0)
-    unknown_count = status_counts_raw.get("0", 0) + status_counts_raw.get("9", 0)
-    
-    # Total stations
-    total_stations = len(db.charger_master.distinct("statId"))
-    
-    availability_rate = (available_count / total_chargers * 100) if total_chargers > 0 else 0
-    
-    return StatsSummaryResponse(
-        totalChargers=total_chargers,
-        totalStations=total_stations,
-        statusCounts={str(k): v for k, v in status_counts_raw.items()},
-        availableCount=available_count,
-        chargingCount=charging_count,
-        faultCount=fault_count,
-        unknownCount=unknown_count,
-        availabilityRate=availability_rate,
-        generatedAt=latest.get("collectedAt"),
-        generatedAtKst=latest.get("collectedAtKst"),
-        collectedAtBucket=bucket
-    )
 
-def get_stats_overview(
-    db: Database, 
-    gu: str = None, 
-    dong: str = None, 
-    at: datetime = None
-) -> StatsOverviewResponse:
-    latest = get_latest_bucket(db, at)
-    bucket = latest["collectedAtBucket"] if latest else None
-    
-    # 1. Join master and snapshot
-    pipeline = []
-    
-    # Match criteria for region
-    match_master = {"delYn": {"$ne": "Y"}}
-    if gu:
-        match_master["addr"] = {"$regex": gu}
-    if dong:
-        match_master["addr"] = {"$regex": dong}
-        
-    pipeline.append({"$match": match_master})
-    
-    # Lookup status
-    pipeline.append({
-        "$lookup": {
-            "from": "charger_status_snapshot",
-            "let": {"sid": "$statId", "cid": "$chgerId"},
-            "pipeline": [
-                {"$match": {
-                    "$expr": {
-                        "$and": [
-                            {"$eq": ["$collectedAtBucket", bucket]},
-                            {"$eq": ["$statId", "$$sid"]},
-                            {"$eq": ["$chgerId", "$$cid"]}
-                        ]
-                    }
-                }}
-            ],
-            "as": "status"
-        }
-    })
-    
-    pipeline.append({
-        "$addFields": {
-            "statusDoc": {"$arrayElemAt": ["$status", 0]}
-        }
-    })
-    
-    # Project needed fields and calculated fields
-    pipeline.append({
-        "$project": {
+def _status_docs_for_bucket(db: Database, bucket: datetime | None) -> dict[tuple[str, str], dict[str, Any]]:
+    if bucket is None:
+        return {}
+    cursor = db.charger_status_snapshot.find(
+        {"collectedAtBucket": bucket},
+        {
+            "_id": 0,
             "statId": 1,
             "chgerId": 1,
-            "statNm": 1,
-            "addr": 1,
-            "lat": 1,
-            "lng": 1,
-            "chgerType": 1,
-            "output": 1,
-            "kind": 1,
-            "stat": "$statusDoc.stat",
-            "nowTsdt": "$statusDoc.nowTsdt",
-            "outputNum": {"$toDouble": "$output"}
-        }
-    })
-    
-    results = list(db.charger_master.aggregate(pipeline))
-    
-    # Aggregation in memory for simplicity (can be done in pipeline too)
-    total_chargers = len(results)
-    stations = set()
-    available_count = 0
-    charging_count = 0
-    fault_count = 0
-    maintenance_count = 0
-    stopped_count = 0
-    communication_error_count = 0
-    unknown_count = 0
-    
-    rapid_chargers = 0
-    slow_chargers = 0
-    ultra_fast_chargers = 0
-    
-    outputs = []
-    
-    long_occupancy_items = []
-    threshold = 360 # 6 hours for long occupancy example
-    
-    status_distribution = {}
-    charger_type_distribution = {}
-    facility_distribution = {}
-    
-    for r in results:
-        stations.add(r["statId"])
-        stat = r.get("stat")
-        
-        # Status counts
-        if stat == "2": available_count += 1
-        elif stat == "3": charging_count += 1
-        elif stat == "1": communication_error_count += 1
-        elif stat == "4": stopped_count += 1
-        elif stat == "5": maintenance_count += 1
-        elif stat in ["0", "9", None]: unknown_count += 1
-        
-        if stat in ["1", "4", "5"]:
+            "stat": 1,
+            "statUpdDt": 1,
+            "nowTsdt": 1,
+            "lastTsdt": 1,
+            "lastTedt": 1,
+            "collectedAt": 1,
+            "collectedAtKst": 1,
+            "raw": 1,
+        },
+    )
+    result: dict[tuple[str, str], dict[str, Any]] = {}
+    for doc in cursor:
+        stat_id = _normalize_text(doc.get("statId"))
+        chger_id = _normalize_text(doc.get("chgerId"))
+        if stat_id and chger_id:
+            result[(stat_id, chger_id)] = doc
+    return result
+
+
+def _current_rows(
+    db: Database,
+    gu: str | None = None,
+    dong: str | None = None,
+    at: datetime | None = None,
+) -> tuple[list[dict[str, Any]], Optional[dict], dict[tuple[str, str], dict[str, Any]]]:
+    latest = get_latest_bucket(db, at)
+    bucket = latest.get("collectedAtBucket") if latest else None
+    status_docs = _status_docs_for_bucket(db, bucket)
+
+    projection = {
+        "_id": 0,
+        "statId": 1,
+        "chgerId": 1,
+        "statNm": 1,
+        "addr": 1,
+        "lat": 1,
+        "lng": 1,
+        "chgerType": 1,
+        "output": 1,
+        "kind": 1,
+        "kindDetail": 1,
+        "busiNm": 1,
+        "busiId": 1,
+        "raw": 1,
+    }
+
+    rows: list[dict[str, Any]] = []
+    for master in db.charger_master.find(_master_match(gu, dong), projection):
+        stat_id = _normalize_text(master.get("statId"))
+        chger_id = _normalize_text(master.get("chgerId"))
+        status_doc = status_docs.get((stat_id, chger_id), {}) if stat_id and chger_id else {}
+        raw_status = status_doc.get("raw") or {}
+        stat = _normalize_text(status_doc.get("stat")) or _normalize_text(raw_status.get("stat"))
+        rows.append({**master, "statusDoc": status_doc, "stat": stat})
+    return rows, latest, status_docs
+
+
+def _get_status_ts(status_doc: dict[str, Any], key: str) -> str | None:
+    raw = status_doc.get("raw") or {}
+    return _normalize_text(status_doc.get(key)) or _normalize_text(raw.get(key))
+
+
+def _parse_kst_compact_datetime(value: str | None) -> datetime | None:
+    if not value:
+        return None
+    try:
+        return datetime.strptime(value, "%Y%m%d%H%M%S").replace(tzinfo=KST)
+    except ValueError:
+        return None
+
+
+def _reference_kst(latest: dict | None) -> datetime:
+    if latest and latest.get("collectedAt"):
+        converted = _to_kst(latest.get("collectedAt"))
+        if converted:
+            return converted
+    return datetime.now(KST)
+
+
+def _long_occupancy_item(row: dict[str, Any], latest: dict | None) -> LongOccupancyItem | None:
+    if row.get("stat") != "3":
+        return None
+    status_doc = row.get("statusDoc") or {}
+    started_at = _parse_kst_compact_datetime(_get_status_ts(status_doc, "nowTsdt"))
+    if not started_at:
+        return None
+    duration = int((_reference_kst(latest) - started_at).total_seconds() // 60)
+    if duration < LONG_OCCUPANCY_THRESHOLD_MINUTES:
+        return None
+    return LongOccupancyItem(
+        statId=row.get("statId"),
+        chgerId=row.get("chgerId"),
+        statNm=row.get("statNm"),
+        addr=row.get("addr"),
+        gu=extract_gu(row.get("addr")),
+        dong=extract_dong(row.get("addr")),
+        output=row.get("output"),
+        nowTsdt=_get_status_ts(status_doc, "nowTsdt"),
+        durationMinutes=max(duration, 0),
+        lat=row.get("lat"),
+        lng=row.get("lng"),
+    )
+
+
+def _overview_from_rows(
+    rows: list[dict[str, Any]],
+    latest: dict | None,
+    gu: str | None = None,
+    dong: str | None = None,
+) -> StatsOverviewResponse:
+    total_chargers = len(rows)
+    stations: set[str] = set()
+
+    available_count = charging_count = fault_count = 0
+    maintenance_count = stopped_count = communication_error_count = unknown_count = 0
+    rapid_chargers = slow_chargers = ultra_fast_chargers = 0
+
+    outputs: list[float] = []
+    long_occupancy_items: list[LongOccupancyItem] = []
+    status_distribution: dict[str, int] = defaultdict(int)
+    charger_type_distribution: dict[str, int] = defaultdict(int)
+    facility_distribution: dict[str, int] = defaultdict(int)
+
+    for row in rows:
+        stat_id = row.get("statId")
+        if stat_id:
+            stations.add(stat_id)
+
+        stat = row.get("stat")
+        if stat == "2":
+            available_count += 1
+        elif stat == "3":
+            charging_count += 1
+        elif stat == "1":
+            communication_error_count += 1
+        elif stat == "4":
+            stopped_count += 1
+        elif stat == "5":
+            maintenance_count += 1
+        else:
+            unknown_count += 1
+
+        if stat in FAULT_STATUSES:
             fault_count += 1
-            
-        status_label = STATUS_MAP.get(stat, "알수없음")
-        status_distribution[status_label] = status_distribution.get(status_label, 0) + 1
-        
-        # Charger types
-        out_val = safe_float(r.get("output"))
-        if out_val >= 200:
+
+        status_distribution[STATUS_MAP.get(stat, "알수없음")] += 1
+
+        output_value = safe_float(row.get("output"))
+        if output_value >= 200:
             ultra_fast_chargers += 1
-            type_label = "초급속"
-        elif out_val >= 50:
+            charger_type_distribution["초급속"] += 1
+        elif output_value >= 50:
             rapid_chargers += 1
-            type_label = "급속"
+            charger_type_distribution["급속"] += 1
         else:
             slow_chargers += 1
-            type_label = "완속"
-        
-        charger_type_distribution[type_label] = charger_type_distribution.get(type_label, 0) + 1
-        
-        if out_val > 0:
-            outputs.append(out_val)
-            
-        # Facility type
-        kind = r.get("kind") or "기타"
-        facility_distribution[kind] = facility_distribution.get(kind, 0) + 1
-        
-        # Long occupancy
-        if stat == "3" and r.get("nowTsdt"):
-            try:
-                # nowTsdt format: 20240320143000
-                ts = datetime.strptime(r["nowTsdt"], "%Y%m%d%H%M%S")
-                duration = (datetime.now() - ts).total_seconds() / 60
-                if duration > threshold:
-                    long_occupancy_items.append(LongOccupancyItem(
-                        statId=r["statId"],
-                        chgerId=r["chgerId"],
-                        statNm=r.get("statNm"),
-                        addr=r.get("addr"),
-                        gu=extract_gu(r.get("addr")),
-                        dong=extract_dong(r.get("addr")),
-                        output=r.get("output"),
-                        nowTsdt=r.get("nowTsdt"),
-                        durationMinutes=int(duration),
-                        lat=r.get("lat"),
-                        lng=r.get("lng")
-                    ))
-            except:
-                pass
+            charger_type_distribution["완속"] += 1
+        if output_value > 0:
+            outputs.append(output_value)
 
-    availability_rate = (available_count / total_chargers * 100) if total_chargers > 0 else 0
-    avg_output = sum(outputs) / len(outputs) if outputs else 0
-    max_output = max(outputs) if outputs else 0
-    
+        raw = row.get("raw") or {}
+        facility_key = row.get("kind") or raw.get("kind") or row.get("kindDetail") or raw.get("kindDetail") or "기타"
+        facility_distribution[str(facility_key)] += 1
+
+        item = _long_occupancy_item(row, latest)
+        if item:
+            long_occupancy_items.append(item)
+
+    long_occupancy_items.sort(key=lambda item: item.durationMinutes, reverse=True)
+
     return StatsOverviewResponse(
         scope=ScopeInfo(gu=gu, dong=dong),
-        updatedAt=latest.get("collectedAtKst") if latest else None,
+        updatedAt=_iso_kst(latest.get("collectedAt") if latest else None, latest.get("collectedAtKst") if latest else None),
         totalChargers=total_chargers,
         totalStations=len(stations),
         rapidChargers=rapid_chargers,
@@ -279,164 +338,322 @@ def get_stats_overview(
         chargingCount=charging_count,
         faultCount=fault_count,
         maintenanceCount=maintenance_count,
-        stopped_count=stopped_count,
+        stoppedCount=stopped_count,
         communicationErrorCount=communication_error_count,
         unknownCount=unknown_count,
-        availabilityRate=availability_rate,
-        avgOutput=avg_output,
-        maxOutput=max_output,
+        availabilityRate=round((available_count / total_chargers * 100), 2) if total_chargers else 0,
+        avgOutput=round(sum(outputs) / len(outputs), 2) if outputs else 0,
+        maxOutput=max(outputs) if outputs else 0,
         longOccupancy=LongOccupancyStats(
             count=len(long_occupancy_items),
-            thresholdMinutes=threshold,
-            items=long_occupancy_items[:20] # Limit to top 20
+            thresholdMinutes=LONG_OCCUPANCY_THRESHOLD_MINUTES,
+            items=long_occupancy_items[:20],
         ),
-        statusDistribution=status_distribution,
-        chargerTypeDistribution=charger_type_distribution,
-        facilityDistribution=facility_distribution
+        statusDistribution=dict(status_distribution),
+        chargerTypeDistribution=dict(charger_type_distribution),
+        facilityDistribution=dict(facility_distribution),
     )
+
+
+def get_stats_summary(db: Database) -> Optional[StatsSummaryResponse]:
+    latest = get_latest_bucket(db)
+    if not latest:
+        return None
+
+    bucket = latest.get("collectedAtBucket")
+    pipeline = [
+        {"$match": {"collectedAtBucket": bucket}},
+        {"$group": {"_id": "$stat", "count": {"$sum": 1}}},
+    ]
+    status_counts_raw = {
+        str(doc.get("_id") or "0"): doc.get("count", 0)
+        for doc in db.charger_status_snapshot.aggregate(pipeline)
+    }
+
+    total_chargers = sum(status_counts_raw.values())
+    available_count = status_counts_raw.get("2", 0)
+    charging_count = status_counts_raw.get("3", 0)
+    fault_count = sum(status_counts_raw.get(s, 0) for s in FAULT_STATUSES)
+    unknown_count = status_counts_raw.get("0", 0) + status_counts_raw.get("9", 0) + status_counts_raw.get("None", 0)
+    total_stations = len(db.charger_master.distinct("statId", {"delYn": {"$ne": "Y"}}))
+
+    return StatsSummaryResponse(
+        totalChargers=total_chargers,
+        totalStations=total_stations,
+        statusCounts=status_counts_raw,
+        availableCount=available_count,
+        chargingCount=charging_count,
+        faultCount=fault_count,
+        unknownCount=unknown_count,
+        availabilityRate=round((available_count / total_chargers * 100), 2) if total_chargers else 0,
+        generatedAt=latest.get("collectedAt"),
+        generatedAtKst=_iso_kst(latest.get("collectedAt"), latest.get("collectedAtKst")),
+        collectedAtBucket=bucket.isoformat() if hasattr(bucket, "isoformat") else str(bucket),
+    )
+
+
+def get_stats_overview(
+    db: Database,
+    gu: str | None = None,
+    dong: str | None = None,
+    at: datetime | None = None,
+) -> StatsOverviewResponse:
+    rows, latest, _ = _current_rows(db, gu=gu, dong=dong, at=at)
+    return _overview_from_rows(rows, latest, gu=gu, dong=dong)
+
+
+def _group_current_rows(rows: list[dict[str, Any]], group_key: str) -> list[dict[str, Any]]:
+    grouped: dict[str, list[dict[str, Any]]] = defaultdict(list)
+    for row in rows:
+        key = extract_gu(row.get("addr")) if group_key == "gu" else extract_dong(row.get("addr"))
+        grouped[key].append(row)
+    result = []
+    for key, group_rows in grouped.items():
+        stations = {r.get("statId") for r in group_rows if r.get("statId")}
+        chargers = len(group_rows)
+        available = sum(1 for r in group_rows if r.get("stat") == "2")
+        charging = sum(1 for r in group_rows if r.get("stat") == "3")
+        fault = sum(1 for r in group_rows if r.get("stat") in FAULT_STATUSES)
+        outputs = [safe_float(r.get("output")) for r in group_rows if safe_float(r.get("output")) > 0]
+        rapid = sum(1 for r in group_rows if 50 <= safe_float(r.get("output")) < 200)
+        slow = sum(1 for r in group_rows if safe_float(r.get("output")) < 50)
+        ultra = sum(1 for r in group_rows if safe_float(r.get("output")) >= 200)
+        result.append(
+            {
+                "key": key,
+                "stations": len(stations),
+                "chargers": chargers,
+                "available": available,
+                "charging": charging,
+                "fault": fault,
+                "availabilityRate": round((available / chargers * 100), 2) if chargers else 0,
+                "avgOutput": round(sum(outputs) / len(outputs), 2) if outputs else 0,
+                "rapidChargers": rapid,
+                "slowChargers": slow,
+                "ultraFastChargers": ultra,
+            }
+        )
+    return sorted(result, key=lambda x: (-x["chargers"], x["key"]))
+
+
+def get_districts_stats(db: Database, at: datetime | None = None) -> list[DistrictStatItem]:
+    rows, _, _ = _current_rows(db, at=at)
+    return [
+        DistrictStatItem(
+            gu=item["key"],
+            stations=item["stations"],
+            chargers=item["chargers"],
+            available=item["available"],
+            charging=item["charging"],
+            fault=item["fault"],
+            availabilityRate=item["availabilityRate"],
+            avgOutput=item["avgOutput"],
+            rapidChargers=item["rapidChargers"],
+            slowChargers=item["slowChargers"],
+            ultraFastChargers=item["ultraFastChargers"],
+        )
+        for item in _group_current_rows(rows, "gu")
+        if item["key"] != "구 미상"
+    ]
+
+
+def get_dongs_stats(db: Database, gu: str, at: datetime | None = None) -> list[DongStatItem]:
+    rows, _, _ = _current_rows(db, gu=gu, at=at)
+    return [
+        DongStatItem(
+            dong=item["key"],
+            stations=item["stations"],
+            chargers=item["chargers"],
+            available=item["available"],
+            charging=item["charging"],
+            fault=item["fault"],
+            availabilityRate=item["availabilityRate"],
+            avgOutput=item["avgOutput"],
+            rapidChargers=item["rapidChargers"],
+            slowChargers=item["slowChargers"],
+            ultraFastChargers=item["ultraFastChargers"],
+        )
+        for item in _group_current_rows(rows, "dong")
+        if item["key"] != "동 미상"
+    ]
+
+
+def _top_group_fault_rate(rows: list[dict[str, Any]], field_getter, limit: int = 10) -> list[dict[str, Any]]:
+    grouped: dict[str, dict[str, int]] = defaultdict(lambda: {"total": 0, "fault": 0})
+    for row in rows:
+        name = field_getter(row) or "미상"
+        grouped[str(name)]["total"] += 1
+        if row.get("stat") in FAULT_STATUSES:
+            grouped[str(name)]["fault"] += 1
+    items = [
+        {"name": name, "total": v["total"], "fault": v["fault"], "rate": round(v["fault"] / v["total"] * 100, 2) if v["total"] else 0}
+        for name, v in grouped.items()
+    ]
+    return sorted(items, key=lambda x: (-x["fault"], -x["total"], x["name"]))[:limit]
+
+
+def _install_year_fault_rate(rows: list[dict[str, Any]]) -> list[dict[str, Any]]:
+    grouped: dict[str, dict[str, int]] = defaultdict(lambda: {"total": 0, "fault": 0})
+    for row in rows:
+        raw = row.get("raw") or {}
+        year = _normalize_text(raw.get("year")) or "미상"
+        grouped[year]["total"] += 1
+        if row.get("stat") in FAULT_STATUSES:
+            grouped[year]["fault"] += 1
+    return [
+        {"year": year, "total": v["total"], "fault": v["fault"], "rate": round(v["fault"] / v["total"] * 100, 2) if v["total"] else 0}
+        for year, v in sorted(grouped.items(), key=lambda kv: kv[0])
+    ]
+
+
+def _status_history_rows(db: Database, latest: dict | None, days: int = 7) -> list[dict[str, Any]]:
+    if not latest or not latest.get("collectedAtBucket"):
+        return []
+    end = latest["collectedAtBucket"]
+    start = end - timedelta(days=days)
+    cursor = db.charger_status_snapshot.find(
+        {"collectedAtBucket": {"$gte": start, "$lte": end}},
+        {"_id": 0, "stat": 1, "collectedAtBucket": 1, "raw": 1},
+    )
+    return list(cursor)
+
+
+def _availability_by_weekday(history: list[dict[str, Any]]) -> list[dict[str, Any]]:
+    grouped: dict[int, dict[str, int]] = defaultdict(lambda: {"total": 0, "available": 0})
+    for row in history:
+        bucket = row.get("collectedAtBucket")
+        kst = _to_kst(bucket)
+        if not kst:
+            continue
+        weekday = kst.weekday()
+        grouped[weekday]["total"] += 1
+        if row.get("stat") == "2":
+            grouped[weekday]["available"] += 1
+    return [
+        {
+            "day": WEEKDAY_LABELS[idx],
+            "rate": round(grouped[idx]["available"] / grouped[idx]["total"] * 100, 2) if grouped[idx]["total"] else 0,
+            "total": grouped[idx]["total"],
+        }
+        for idx in range(7)
+    ]
+
+
+def _availability_heatmap(history: list[dict[str, Any]]) -> list[dict[str, Any]]:
+    grouped: dict[tuple[int, int], dict[str, int]] = defaultdict(lambda: {"total": 0, "available": 0, "charging": 0})
+    for row in history:
+        bucket = row.get("collectedAtBucket")
+        kst = _to_kst(bucket)
+        if not kst:
+            continue
+        key = (kst.weekday(), kst.hour)
+        grouped[key]["total"] += 1
+        if row.get("stat") == "2":
+            grouped[key]["available"] += 1
+        if row.get("stat") == "3":
+            grouped[key]["charging"] += 1
+    items = []
+    for weekday in range(7):
+        for hour in range(24):
+            cell = grouped[(weekday, hour)]
+            total = cell["total"]
+            items.append(
+                {
+                    "day": WEEKDAY_LABELS[weekday],
+                    "weekday": weekday,
+                    "hour": hour,
+                    "availabilityRate": round(cell["available"] / total * 100, 2) if total else 0,
+                    "chargingRate": round(cell["charging"] / total * 100, 2) if total else 0,
+                    "total": total,
+                }
+            )
+    return items
+
+
+def _weekday_weekend_hourly_usage(history: list[dict[str, Any]]) -> list[dict[str, Any]]:
+    grouped: dict[tuple[str, int], dict[str, int]] = defaultdict(lambda: {"total": 0, "charging": 0})
+    for row in history:
+        bucket = row.get("collectedAtBucket")
+        kst = _to_kst(bucket)
+        if not kst:
+            continue
+        day_type = "weekend" if kst.weekday() >= 5 else "weekday"
+        key = (day_type, kst.hour)
+        grouped[key]["total"] += 1
+        if row.get("stat") == "3":
+            grouped[key]["charging"] += 1
+    return [
+        {
+            "type": day_type,
+            "hour": hour,
+            "chargingCount": grouped[(day_type, hour)]["charging"],
+            "chargingRate": round(grouped[(day_type, hour)]["charging"] / grouped[(day_type, hour)]["total"] * 100, 2) if grouped[(day_type, hour)]["total"] else 0,
+            "total": grouped[(day_type, hour)]["total"],
+        }
+        for day_type in ["weekday", "weekend"]
+        for hour in range(24)
+    ]
+
+
+def _trend_from_charger_stats(db: Database, latest: dict | None, limit: int = 48) -> list[dict[str, Any]]:
+    if not latest:
+        return []
+    cursor = db.charger_stats.find(
+        {"type": "basic_status_snapshot"},
+        {"_id": 0, "collectedAtBucket": 1, "statusCounts": 1, "totalChargers": 1},
+    ).sort("collectedAtBucket", -1).limit(limit)
+    items = []
+    for row in cursor:
+        counts = row.get("statusCounts") or {}
+        total = row.get("totalChargers") or sum(counts.values())
+        fault = sum(counts.get(s, 0) for s in FAULT_STATUSES)
+        bucket = row.get("collectedAtBucket")
+        items.append(
+            {
+                "time": _iso_kst(bucket),
+                "fault": fault,
+                "total": total,
+                "rate": round(fault / total * 100, 2) if total else 0,
+            }
+        )
+    return list(reversed(items))
+
 
 def get_dashboard_stats(
     db: Database,
-    gu: str = None,
-    dong: str = None,
-    at: datetime = None
+    gu: str | None = None,
+    dong: str | None = None,
+    at: datetime | None = None,
 ) -> DashboardStatsResponse:
-    # This is a complex one, returning dummy data for now to satisfy the UI requirement
-    # while using real counts where possible.
-    overview = get_stats_overview(db, gu, dong, at)
-    
-    # Real-ish KPIs
-    kpis = {
-        "totalChargers": overview.totalChargers,
-        "availabilityRate": overview.availabilityRate,
-        "faultCount": overview.faultCount,
-        "longOccupancyCount": overview.longOccupancy.count,
-    }
-    
-    # Placeholder for manufacturer fault rate
-    manufacturer_fault_rate = [
-        {"name": "대영채비", "total": 120, "fault": 5, "rate": 4.1},
-        {"name": "시그넷이브이", "total": 80, "fault": 2, "rate": 2.5},
-        {"name": "중앙제어", "total": 60, "fault": 3, "rate": 5.0},
-        {"name": "에스트래픽", "total": 45, "fault": 1, "rate": 2.2},
+    rows, latest, _ = _current_rows(db, gu=gu, dong=dong, at=at)
+    overview = _overview_from_rows(rows, latest, gu=gu, dong=dong)
+    history = _status_history_rows(db, latest, days=7) if not gu and not dong else []
+
+    facility_type_distribution = [
+        {"name": name, "value": value}
+        for name, value in sorted(overview.facilityDistribution.items(), key=lambda kv: -kv[1])
     ]
-    
-    # Placeholder for install year
-    install_year_fault_rate = [
-        {"year": "2020", "count": 10},
-        {"year": "2021", "count": 15},
-        {"year": "2022", "count": 25},
-        {"year": "2023", "count": 40},
-        {"year": "2024", "count": 12},
-    ]
-    
-    # Placeholder for availability by weekday
-    availability_by_weekday = [
-        {"day": "월", "rate": 85},
-        {"day": "화", "rate": 82},
-        {"day": "수", "rate": 84},
-        {"day": "목", "rate": 80},
-        {"day": "금", "rate": 75},
-        {"day": "토", "rate": 65},
-        {"day": "일", "rate": 70},
-    ]
-    
-    # Facility distribution from overview
-    facility_type_distribution = [{"name": k, "value": v} for k, v in overview.facilityDistribution.items()]
-    
+    district_ranking = [item.model_dump() for item in get_districts_stats(db, at=at)[:10]] if not gu and not dong else []
+
     return DashboardStatsResponse(
-        kpis=kpis,
-        manufacturerFaultRate=manufacturer_fault_rate,
-        installYearFaultRate=install_year_fault_rate,
-        availabilityByWeekday=availability_by_weekday,
-        availabilityHeatmap=[],
-        weekdayWeekendHourlyUsage=[],
-        facilityTypeDistribution=facility_type_distribution,
-        facilityTypeCounts=[],
-        faultTrend=[],
-        longOccupancyTrend=[],
-        districtRanking=[]
-    )
-
-def get_districts_stats(db: Database, at: datetime = None) -> list[DistrictStatItem]:
-    latest = get_latest_bucket(db, at)
-    bucket = latest["collectedAtBucket"] if latest else None
-    
-    # Aggregation for all districts
-    pipeline = [
-        {"$match": {"delYn": {"$ne": "Y"}}},
-        {
-            "$lookup": {
-                "from": "charger_status_snapshot",
-                "let": {"sid": "$statId", "cid": "$chgerId"},
-                "pipeline": [
-                    {"$match": {
-                        "$expr": {
-                            "$and": [
-                                {"$eq": ["$collectedAtBucket", bucket]},
-                                {"$eq": ["$statId", "$$sid"]},
-                                {"$eq": ["$chgerId", "$$cid"]}
-                            ]
-                        }
-                    }}
-                ],
-                "as": "status"
-            }
+        kpis={
+            "totalChargers": overview.totalChargers,
+            "totalStations": overview.totalStations,
+            "availabilityRate": overview.availabilityRate,
+            "availableCount": overview.availableCount,
+            "chargingCount": overview.chargingCount,
+            "faultCount": overview.faultCount,
+            "longOccupancyCount": overview.longOccupancy.count,
+            "updatedAt": overview.updatedAt,
         },
-        {"$addFields": {"stat": {"$arrayElemAt": ["$status.stat", 0]}}},
-        {
-            "$group": {
-                "_id": {"$arrayElemAt": [{"$split": ["$addr", " "]}, 1]}, # Very naive Gu extraction
-                "stations": {"$addToSet": "$statId"},
-                "chargers": {"$sum": 1},
-                "available": {"$sum": {"$cond": [{"$eq": ["$stat", "2"]}, 1, 0]}},
-                "charging": {"$sum": {"$cond": [{"$eq": ["$stat", "3"]}, 1, 0]}},
-                "fault": {"$sum": {"$cond": [{"$in": ["$stat", ["1", "4", "5"]]}, 1, 0]}},
-                "outputs": {"$push": {"$toDouble": "$output"}},
-                "rapid": {"$sum": {"$cond": [{"$and": [{"$gte": [{"$toDouble": "$output"}, 50]}, {"$lt": [{"$toDouble": "$output"}, 200]}]}, 1, 0]}},
-                "slow": {"$sum": {"$cond": [{"$lt": [{"$toDouble": "$output"}, 50]}, 1, 0]}},
-                "ultra": {"$sum": {"$cond": [{"$gte": [{"$toDouble": "$output"}, 200]}, 1, 0]}},
-            }
-        }
-    ]
-    
-    results = []
-    for doc in db.charger_master.aggregate(pipeline):
-        gu = doc["_id"] or "미상"
-        if not gu.endswith("구"):
-            # Try to find part that ends with 구
-            pass # Simplified for now
-            
-        chargers = doc["chargers"]
-        outputs = [o for o in doc["outputs"] if o > 0]
-        
-        results.append(DistrictStatItem(
-            gu=gu,
-            stations=len(doc["stations"]),
-            chargers=chargers,
-            available=doc["available"],
-            charging=doc["charging"],
-            fault=doc["fault"],
-            availabilityRate=(doc["available"] / chargers * 100) if chargers > 0 else 0,
-            avgOutput=sum(outputs) / len(outputs) if outputs else 0,
-            rapidChargers=doc["rapid"],
-            slowChargers=doc["slow"],
-            ultraFastChargers=doc["ultra"]
-        ))
-        
-    return sorted(results, key=lambda x: -x.stations)
-
-def get_dongs_stats(db: Database, gu: str, at: datetime = None) -> list[DongStatItem]:
-    # Similar to districts but filtered by gu and grouped by dong
-    latest = get_latest_bucket(db, at)
-    bucket = latest["collectedAtBucket"] if latest else None
-    
-    # We'll use memory processing for Dong as extraction is tricky in mongo pipeline
-    # without complex regex
-    overview = get_stats_overview(db, gu=gu, at=at)
-    # Actually overview already does this but doesn't group by dong.
-    # Let's do a simplified version.
-    
-    # For now, let's just return a placeholder or do a full scan if needed.
-    # In a real app, we'd have a 'dong' field in the document.
-    return []
+        manufacturerFaultRate=_top_group_fault_rate(rows, lambda r: (r.get("raw") or {}).get("maker") or r.get("busiNm")),
+        installYearFaultRate=_install_year_fault_rate(rows),
+        availabilityByWeekday=_availability_by_weekday(history),
+        availabilityHeatmap=_availability_heatmap(history),
+        weekdayWeekendHourlyUsage=_weekday_weekend_hourly_usage(history),
+        facilityTypeDistribution=facility_type_distribution,
+        facilityTypeCounts=facility_type_distribution,
+        faultTrend=_trend_from_charger_stats(db, latest),
+        longOccupancyTrend=[],
+        districtRanking=district_ranking,
+    )

@@ -310,10 +310,17 @@ def _build_single(key: str, op: str, value: str) -> dict:
             raise ValueError(f"'{key}' 는 숫자여야 합니다: '{value}'")
 
         if field in STR_NUMERIC_FIELDS:
-            # 문자열 저장 필드 → $expr + $toInt
+            # 문자열 저장 숫자 필드는 빈 문자열/비숫자 값에서 MongoDB 변환 에러가 나지 않도록 $convert 사용
             dollar_field = f"${field}"
-            safe_int = {"$toInt": {"$ifNull": [dollar_field, "0"]}}
-            return {"$expr": {mongo_op: [safe_int, int(num)]}}
+            safe_number = {
+                "$convert": {
+                    "input": {"$ifNull": [dollar_field, "0"]},
+                    "to": "double",
+                    "onError": 0,
+                    "onNull": 0,
+                }
+            }
+            return {"$expr": {mongo_op: [safe_number, num]}}
 
         return {field: {mongo_op: num}}
 
@@ -475,6 +482,15 @@ def _find_target_bucket(db: Database, at: datetime) -> datetime | None:
     return doc["collectedAtBucket"] if doc else None
 
 
+def _find_latest_bucket(db: Database) -> datetime | None:
+    """가장 최근 collectedAtBucket을 반환."""
+    doc = db.charger_status_snapshot.find_one(
+        {},
+        sort=[("collectedAtBucket", -1), ("collectedAt", -1)],
+    )
+    return doc["collectedAtBucket"] if doc else None
+
+
 def _build_status_map_at(db: Database, bucket: datetime) -> dict[tuple[str, str], str]:
     """특정 bucket의 {(statId, chgerId): stat} 맵을 반환."""
     cursor = db.charger_status_snapshot.find(
@@ -544,71 +560,69 @@ def _to_result(doc: dict, status_map: dict[tuple[str, str], str] | None = None) 
 
 def search_chargers(db: Database, req: SearchRequest, debug: bool = False) -> SearchResponse:
     filters = list(req.filters)
-    status_map: dict[tuple[str, str], str] | None = None
     target_bucket: datetime | None = None
+    status_map: dict[tuple[str, str], str] | None = None
     complex_clause: dict = {}
 
     # ── query 문자열 파싱 ────────────────────────────────────────────────
-    # AND-전용 조건은 Condition 리스트로 변환하여 at 스냅샷 연동 가능하게 함
+    # AND-전용 조건은 Condition 리스트로 변환하여 최신/기준 스냅샷 상태와 연동
     # OR 포함 복합 표현은 MongoDB dict로 변환 후 마지막에 AND 병합
     if req.query and req.query.strip():
         simple_items, complex_clause = _try_parse_to_filter_items(req.query)
         filters = simple_items + filters
 
-    # ── 시간 기반 필터링 ────────────────────────────────────────────────
+    # ── 충전상태 조건 분리 ───────────────────────────────────────────────
+    # charger_master.raw.stat은 기본정보 API 기준이라 최신 상태와 다를 수 있음.
+    # 따라서 충전상태 조건은 charger_status_snapshot의 최신 bucket 기준으로 Python에서 필터링.
+    stat_conds, filters = _extract_stat_conditions(filters)
+
     if req.at is not None:
         target_bucket = _find_target_bucket(db, req.at)
-
-        stat_conds, filters = _extract_stat_conditions(filters)
-
-        if target_bucket is not None:
-            status_map = _build_status_map_at(db, target_bucket)
-
-            if stat_conds:
-                # snapshot에서 조건을 만족하는 (statId, chgerId) 쌍만 추출
-                allowed_pairs = [
-                    (sid, cid)
-                    for (sid, cid), stat in status_map.items()
-                    if _match_stat(stat, stat_conds)
-                ]
-                if not allowed_pairs:
-                    return SearchResponse(
-                        results=[],
-                        total=0,
-                        snapshot_bucket=target_bucket,
-                        query_debug={} if debug else None,
-                    )
-                # 허용된 쌍을 master 쿼리에 추가
-                pair_clause: dict = {
-                    "$or": [{"statId": sid, "chgerId": cid} for sid, cid in allowed_pairs]
-                }
-                filters = list(filters)  # already extracted above
-                # pair_clause will be merged after building the main query
-            else:
-                pair_clause = {}
-        else:
-            # 기준 시각보다 이전 데이터가 없음 → stat 조건 적용 불가
-            if stat_conds:
-                return SearchResponse(
-                    results=[],
-                    total=0,
-                    snapshot_bucket=None,
-                    query_debug={} if debug else None,
-                )
-            pair_clause = {}
     else:
-        stat_conds = []
-        pair_clause = {}
+        target_bucket = _find_latest_bucket(db)
+
+    if target_bucket is not None:
+        status_map = _build_status_map_at(db, target_bucket)
+
+    # 기준 시각보다 이전 데이터가 없는데 상태 조건이 있으면 결과 없음
+    if stat_conds and not status_map:
+        return SearchResponse(
+            results=[],
+            total=0,
+            snapshot_bucket=target_bucket,
+            query_debug={} if debug else None,
+        )
 
     # ── master 쿼리 빌드 ────────────────────────────────────────────────
     query = _build_mongo_query(filters)
 
-    if pair_clause:
-        query = {"$and": [query, pair_clause]} if query else pair_clause
-
-    # OR 포함 복합 절 병합 (at 스냅샷 미연동)
+    # OR 포함 복합 절 병합
+    # 주의: 복합 OR 내부의 충전상태 조건은 기존 호환성을 위해 MongoDB raw.stat 기준으로 처리됨.
+    # 일반 검색창의 '충전상태 == 사용가능 AND 출력 >= 50' 형태는 위 stat_conds 경로로 최신 snapshot과 연동됨.
     if complex_clause:
         query = {"$and": [query, complex_clause]} if query else complex_clause
+
+    # 상태 조건이 있으면 전체 후보를 순회하며 snapshot 상태로 필터링 후 skip/limit 적용
+    if stat_conds:
+        matched: list[ChargerResult] = []
+        total = 0
+        cursor = db.charger_master.find(query)
+        for doc in cursor:
+            stat_id = doc.get("statId")
+            chger_id = doc.get("chgerId")
+            current_stat = status_map.get((stat_id, chger_id)) if status_map is not None else None
+            if not _match_stat(current_stat or "", stat_conds):
+                continue
+            if total >= req.skip and len(matched) < req.limit:
+                matched.append(_to_result(doc, status_map))
+            total += 1
+
+        return SearchResponse(
+            results=matched,
+            total=total,
+            snapshot_bucket=target_bucket,
+            query_debug=query if debug else None,
+        )
 
     total = db.charger_master.count_documents(query)
     cursor = (
