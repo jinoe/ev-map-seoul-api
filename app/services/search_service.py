@@ -91,7 +91,7 @@
 # =============================================================================
 
 import re
-from datetime import datetime, timezone
+from datetime import datetime
 from pymongo.database import Database
 
 from app.schemas.search import (
@@ -104,36 +104,41 @@ from app.schemas.search import (
 
 # ── 필드 매핑 (가이드 명세 24개 필드) ────────────────────────────────
 FIELD_MAP: dict[str, dict] = {
-    # ▶ B 그룹 — 자유 텍스트 / 고유 식별자
+    # ── 1. 충전소 식별 및 기초 정보 ──────────────────────────────────────
     "충전소명":     {"field": "statNm",           "type": "like"},
     "충전소ID":     {"field": "statId",            "type": "eq"},
-    "충전기ID":     {"field": "chgerId",           "type": "eq"},
     "주소":         {"field": "addr",              "type": "like"},
     "시도코드":     {"field": "zcode",             "type": "eq"},
     "시군구코드":   {"field": "raw.zscode",        "type": "eq"},
-    "사업자명":     {"field": "busiNm",            "type": "like"},
+    "위도":         {"field": "lat",               "type": "range"},
+    "경도":         {"field": "lng",               "type": "range"},
+    # ── 2. 운영 주체 및 관리 ─────────────────────────────────────────────
     "사업자코드":   {"field": "busiId",            "type": "eq"},
-    "제조사":       {"field": "raw.maker",         "type": "like"},
-    "이용시간":     {"field": "useTime",           "type": "like"},
-    # ▶ A 그룹 — 범주형 코드
+    "사업자명":     {"field": "busiNm",            "type": "like"},
+    "운영사연락처": {"field": "busiCall",          "type": "like"},
+    # ── 3. 충전 인프라 사양 ───────────────────────────────────────────────
     "충전기타입":   {"field": "chgerType",         "type": "in"},
+    "출력":         {"field": "output",            "type": "range"},
     "충전방식":     {"field": "method",            "type": "in"},
-    "충전상태":     {"field": "raw.stat",          "type": "in"},
-    "주차무료":     {"field": "parkingFree",       "type": "bool"},
-    "이용제한":     {"field": "limitYn",           "type": "bool"},
-    "삭제여부":     {"field": "delYn",             "type": "bool"},
-    "교통영향":     {"field": "raw.trafficYn",     "type": "bool"},
     "충전소구분":   {"field": "kind",              "type": "in"},
     "시설구분상세": {"field": "raw.kindDetail",    "type": "eq"},
-    "설치층구분":   {"field": "raw.floorType",     "type": "bool"},  # F=지상, B=지하
-    # ▶ C 그룹 — 수치형
-    "출력":         {"field": "output",            "type": "range"},
-    "설치년도":     {"field": "raw.year",          "type": "range"},
+    "설치층구분":   {"field": "raw.floorType",     "type": "bool"},
     "설치층수":     {"field": "raw.floorNum",      "type": "range"},
-    # ▶ C 그룹 — 타임스탬프 (14자리 문자열 대소 비교)
+    "설치년도":     {"field": "raw.year",          "type": "range"},
+    "제조사":       {"field": "raw.maker",         "type": "like"},
+    # ── 4. 이용 정책 및 규제 ─────────────────────────────────────────────
+    "이용제한":     {"field": "limitYn",           "type": "bool"},
+    "이용제한상세": {"field": "limitDetail",       "type": "like"},
+    "주차무료":     {"field": "parkingFree",       "type": "bool"},
+    "이용시간":     {"field": "useTime",           "type": "like"},
+    "교통영향":     {"field": "raw.trafficYn",     "type": "bool"},
+    "삭제여부":     {"field": "delYn",             "type": "bool"},
+    # ── 5. 실시간 상태 및 가동률 ─────────────────────────────────────────
+    "충전상태":     {"field": "raw.stat",          "type": "in"},
+    "충전기ID":     {"field": "chgerId",           "type": "eq"},
     "상태변경일":   {"field": "statUpdDt",         "type": "strdate"},
-    "최근충전종료": {"field": "raw.lastTedt",      "type": "strdate"},
     "최근충전시작": {"field": "raw.lastTsdt",      "type": "strdate"},
+    "최근충전종료": {"field": "raw.lastTedt",      "type": "strdate"},
 }
 
 # ── 값 변환 매핑 ──────────────────────────────────────────────────────
@@ -216,19 +221,23 @@ STR_NUMERIC_FIELDS = {"output", "raw.year", "raw.floorNum"}
 # 14자리 문자열 타임스탬프 필드 (어휘적 대소 비교)
 STR_DATE_FIELDS = {"statUpdDt", "raw.lastTedt", "raw.lastTsdt"}
 
+# 충전 상태 우선순위 (사용가능 > 충전중 > 예약중 > 점검중 > 운영중지 > 통신이상 > 미확인)
+STAT_SORT_PRIORITY: list[str] = ["2", "3", "6", "5", "4", "1", "9", "0"]
+
 # ── 검색창 쿼리 파서: 필드명 별칭 맵 ──────────────────────────────────
 # 영문 MongoDB 필드명 또는 한글 별칭 → FIELD_MAP 한글 키
 FIELD_ALIAS_MAP: dict[str, str] = {
     # ▶ 영문 (MongoDB-인접)
-    "statNm": "충전소명",     "statId": "충전소ID",      "chgerId": "충전기ID",
-    "addr": "주소",           "zcode": "시도코드",       "zscode": "시군구코드",
-    "busiNm": "사업자명",     "busiId": "사업자코드",
-    "chgerType": "충전기타입","output": "출력",          "method": "충전방식",
-    "maker": "제조사",        "year": "설치년도",        "stat": "충전상태",
-    "parkingFree": "주차무료","limitYn": "이용제한",     "delYn": "삭제여부",
-    "trafficYn": "교통영향",  "kind": "충전소구분",      "useTime": "이용시간",
-    "kindDetail": "시설구분상세", "floorType": "설치층구분",
-    "floorNum": "설치층수",   "statUpdDt": "상태변경일",
+    "statNm": "충전소명",       "statId": "충전소ID",        "chgerId": "충전기ID",
+    "addr": "주소",             "zcode": "시도코드",         "zscode": "시군구코드",
+    "lat": "위도",              "lng": "경도",
+    "busiNm": "사업자명",       "busiId": "사업자코드",      "busiCall": "운영사연락처",
+    "chgerType": "충전기타입",  "output": "출력",            "method": "충전방식",
+    "maker": "제조사",          "year": "설치년도",          "stat": "충전상태",
+    "parkingFree": "주차무료",  "limitYn": "이용제한",       "limitDetail": "이용제한상세",
+    "delYn": "삭제여부",        "trafficYn": "교통영향",     "kind": "충전소구분",
+    "useTime": "이용시간",      "kindDetail": "시설구분상세","floorType": "설치층구분",
+    "floorNum": "설치층수",     "statUpdDt": "상태변경일",
     "lastTedt": "최근충전종료", "lastTsdt": "최근충전시작",
     # ▶ 한글 별칭 (FIELD_MAP 키가 아닌 것)
     "운영기관": "사업자코드", "사업자": "사업자코드",
@@ -444,7 +453,7 @@ def _try_parse_to_filter_items(query: str) -> tuple[list, dict]:
     """
     쿼리 문자열을 (Condition 리스트, 복합 MongoDB 절)으로 분리.
 
-    - OR 없는 AND 조건 → Condition 리스트 반환 (at 스냅샷 연동 가능)
+    - OR 없는 AND 조건 → Condition 리스트 반환
     - OR 포함 복합 조건 → 빈 리스트 + parse_query_string() dict 반환
     - 평문 키워드 → 충전소명 Condition 반환
     """
@@ -460,7 +469,7 @@ def _try_parse_to_filter_items(query: str) -> tuple[list, dict]:
     if re.search(r"\bOR\b", query, re.IGNORECASE):
         return [], parse_query_string(query)
 
-    # AND 전용 → Condition 리스트 (at 스냅샷 연동 가능)
+    # AND 전용 → Condition 리스트
     and_parts = [p.strip() for p in re.split(r"\bAND\b", query, flags=re.IGNORECASE) if p.strip()]
     conditions: list[Condition] = []
     for part in and_parts:
@@ -470,38 +479,24 @@ def _try_parse_to_filter_items(query: str) -> tuple[list, dict]:
     return conditions, {}
 
 
-def _find_target_bucket(db: Database, at: datetime) -> datetime | None:
-    """at 이전(이하)의 가장 최근 collectedAtBucket을 반환."""
-    # naive datetime은 UTC로 취급
-    if at.tzinfo is None:
-        at = at.replace(tzinfo=timezone.utc)
-    doc = db.charger_status_snapshot.find_one(
-        {"collectedAtBucket": {"$lte": at}},
-        sort=[("collectedAtBucket", -1)],
-    )
-    return doc["collectedAtBucket"] if doc else None
+# charger_current에만 존재하는 필드 (charger_master.find()로 필터 불가)
+CURRENT_ONLY_FIELDS: frozenset[str] = frozenset({
+    "raw.stat", "statUpdDt", "raw.lastTsdt", "raw.lastTedt",
+})
 
 
-def _find_latest_bucket(db: Database) -> datetime | None:
-    """가장 최근 collectedAtBucket을 반환."""
-    doc = db.charger_status_snapshot.find_one(
-        {},
-        sort=[("collectedAtBucket", -1), ("collectedAt", -1)],
-    )
-    return doc["collectedAtBucket"] if doc else None
-
-
-def _build_status_map_at(db: Database, bucket: datetime) -> dict[tuple[str, str], str]:
-    """특정 bucket의 {(statId, chgerId): stat} 맵을 반환."""
-    cursor = db.charger_status_snapshot.find(
-        {"collectedAtBucket": bucket},
-        {"statId": 1, "chgerId": 1, "stat": 1, "_id": 0},
-    )
-    return {(doc["statId"], doc["chgerId"]): doc["stat"] for doc in cursor}
+def _has_user_filter(filters: list, key: str) -> bool:
+    """filters 리스트에 특정 FIELD_MAP 키가 포함되어 있는지 확인."""
+    for item in filters:
+        if isinstance(item, Condition) and item.key == key:
+            return True
+        if isinstance(item, OrGroup) and any(c.key == key for c in item.or_):
+            return True
+    return False
 
 
 def _extract_stat_conditions(filters: list) -> tuple[list[Condition], list]:
-    """최상위 단순 충전상태 조건을 분리. OR 그룹 내부는 분리하지 않음."""
+    """최상위 단순 충전상태 조건을 분리. 나머지는 master 쿼리용으로 반환."""
     stat_conds: list[Condition] = []
     remaining = []
     for item in filters:
@@ -510,6 +505,19 @@ def _extract_stat_conditions(filters: list) -> tuple[list[Condition], list]:
         else:
             remaining.append(item)
     return stat_conds, remaining
+
+
+def _drop_current_only(filters: list) -> list:
+    """charger_current 전용 필드 조건을 제거 (charger_master.find()에서 사용 불가)."""
+    result = []
+    for item in filters:
+        if isinstance(item, Condition):
+            field = FIELD_MAP.get(item.key, {}).get("field", "")
+            if field not in CURRENT_ONLY_FIELDS:
+                result.append(item)
+        elif isinstance(item, OrGroup):
+            result.append(item)
+    return result
 
 
 def _match_stat(stat: str, conditions: list[Condition]) -> bool:
@@ -523,16 +531,72 @@ def _match_stat(stat: str, conditions: list[Condition]) -> bool:
     return True
 
 
-def _to_result(doc: dict, status_map: dict[tuple[str, str], str] | None = None) -> ChargerResult:
+def _build_status_map(
+    db: Database,
+    stat_ids: list[str] | None = None,
+) -> dict[tuple[str, str], str]:
+    """charger_current에서 {(statId, chgerId): stat} 맵을 반환."""
+    q: dict = {"statId": {"$in": stat_ids}} if stat_ids else {}
+    proj = {"statId": 1, "chgerId": 1, "stat": 1, "raw.stat": 1, "_id": 0}
+    result: dict[tuple[str, str], str] = {}
+    for d in db.charger_current.find(q, proj):
+        sid, cid = d.get("statId"), d.get("chgerId")
+        if sid and cid:
+            stat = d.get("stat") or (d.get("raw") or {}).get("stat")
+            result[(sid, cid)] = stat
+    return result
+
+
+def _stat_sort(results: list[ChargerResult]) -> list[ChargerResult]:
+    """stat 우선순위 → 출력 내림차순 정렬."""
+    _rank = {s: i for i, s in enumerate(STAT_SORT_PRIORITY)}
+
+    def _key(r: ChargerResult) -> tuple:
+        rank = _rank.get(r.stat or "", len(STAT_SORT_PRIORITY))
+        try:
+            output_desc = -float(r.output or 0)
+        except (ValueError, TypeError):
+            output_desc = 0.0
+        return (rank, output_desc)
+
+    return sorted(results, key=_key)
+
+
+def _find_latest_snapshot_bucket(db: Database) -> datetime | None:
+    """charger_current에서 가장 최근 lastSnapshotBucket을 반환."""
+    doc = db.charger_current.find_one(
+        {},
+        sort=[("lastSnapshotBucket", -1)],
+        projection={"lastSnapshotBucket": 1, "_id": 0},
+    )
+    if not doc:
+        return None
+    val = doc.get("lastSnapshotBucket")
+    if isinstance(val, datetime):
+        return val
+    if isinstance(val, str):
+        try:
+            return datetime.fromisoformat(val)
+        except ValueError:
+            return None
+    return None
+
+
+def _to_result(
+    doc: dict,
+    status_map: dict[tuple[str, str], str] | None = None,
+) -> ChargerResult:
+    """doc = charger_master 문서, status_map = {(statId, chgerId): stat코드}."""
     raw = doc.get("raw") or {}
     ct = doc.get("chgerType")
     stat_id = doc.get("statId")
     chger_id = doc.get("chgerId")
 
+    stat = None
     if status_map is not None and stat_id and chger_id:
-        stat = status_map.get((stat_id, chger_id)) or raw.get("stat")
-    else:
-        stat = raw.get("stat")
+        stat = status_map.get((stat_id, chger_id))
+    if stat is None:
+        stat = raw.get("stat")  # charger_current 조회 실패 시 master 스태틱 값 사용
 
     return ChargerResult(
         statId=stat_id,
@@ -560,82 +624,69 @@ def _to_result(doc: dict, status_map: dict[tuple[str, str], str] | None = None) 
 
 def search_chargers(db: Database, req: SearchRequest, debug: bool = False) -> SearchResponse:
     filters = list(req.filters)
-    target_bucket: datetime | None = None
-    status_map: dict[tuple[str, str], str] | None = None
     complex_clause: dict = {}
 
     # ── query 문자열 파싱 ────────────────────────────────────────────────
-    # AND-전용 조건은 Condition 리스트로 변환하여 최신/기준 스냅샷 상태와 연동
-    # OR 포함 복합 표현은 MongoDB dict로 변환 후 마지막에 AND 병합
     if req.query and req.query.strip():
         simple_items, complex_clause = _try_parse_to_filter_items(req.query)
         filters = simple_items + filters
 
-    # ── 충전상태 조건 분리 ───────────────────────────────────────────────
-    # charger_master.raw.stat은 기본정보 API 기준이라 최신 상태와 다를 수 있음.
-    # 따라서 충전상태 조건은 charger_status_snapshot의 최신 bucket 기준으로 Python에서 필터링.
+    # ── P0-1: 폐쇄·철거 충전소 기본 제외 ───────────────────────────────
+    if not _has_user_filter(filters, "삭제여부"):
+        filters = [Condition(key="삭제여부", op="==", value="정상운영")] + filters
+
+    # ── 충전상태 조건 분리 (charger_current 기준으로 Python 필터링) ───────
     stat_conds, filters = _extract_stat_conditions(filters)
 
-    if req.at is not None:
-        target_bucket = _find_target_bucket(db, req.at)
-    else:
-        target_bucket = _find_latest_bucket(db)
+    # ── charger_current 전용 필드 조건 제거 (charger_master.find() 불가) ─
+    filters = _drop_current_only(filters)
 
-    if target_bucket is not None:
-        status_map = _build_status_map_at(db, target_bucket)
-
-    # 기준 시각보다 이전 데이터가 없는데 상태 조건이 있으면 결과 없음
-    if stat_conds and not status_map:
-        return SearchResponse(
-            results=[],
-            total=0,
-            snapshot_bucket=target_bucket,
-            query_debug={} if debug else None,
-        )
-
-    # ── master 쿼리 빌드 ────────────────────────────────────────────────
-    query = _build_mongo_query(filters)
-
-    # OR 포함 복합 절 병합
-    # 주의: 복합 OR 내부의 충전상태 조건은 기존 호환성을 위해 MongoDB raw.stat 기준으로 처리됨.
-    # 일반 검색창의 '충전상태 == 사용가능 AND 출력 >= 50' 형태는 위 stat_conds 경로로 최신 snapshot과 연동됨.
+    # ── charger_master 쿼리 빌드 ─────────────────────────────────────────
+    master_query = _build_mongo_query(filters)
     if complex_clause:
-        query = {"$and": [query, complex_clause]} if query else complex_clause
+        master_query = {"$and": [master_query, complex_clause]} if master_query else complex_clause
 
-    # 상태 조건이 있으면 전체 후보를 순회하며 snapshot 상태로 필터링 후 skip/limit 적용
+    snapshot_bucket = _find_latest_snapshot_bucket(db)
+
+    # ── 충전상태 필터: 전체 스캔 후 Python 필터링 ───────────────────────
     if stat_conds:
+        status_map = _build_status_map(db)  # 전체 현재 상태 로드
+
         matched: list[ChargerResult] = []
         total = 0
-        cursor = db.charger_master.find(query)
-        for doc in cursor:
-            stat_id = doc.get("statId")
-            chger_id = doc.get("chgerId")
-            current_stat = status_map.get((stat_id, chger_id)) if status_map is not None else None
+        for doc in db.charger_master.find(master_query):
+            sid, cid = doc.get("statId"), doc.get("chgerId")
+            current_stat = status_map.get((sid, cid)) if sid and cid else None
             if not _match_stat(current_stat or "", stat_conds):
                 continue
-            if total >= req.skip and len(matched) < req.limit:
-                matched.append(_to_result(doc, status_map))
             total += 1
+            if total > req.skip and len(matched) < req.limit:
+                matched.append(_to_result(doc, {(sid, cid): current_stat}))
 
         return SearchResponse(
-            results=matched,
+            results=_stat_sort(matched),
             total=total,
-            snapshot_bucket=target_bucket,
-            query_debug=query if debug else None,
+            snapshot_bucket=snapshot_bucket,
+            query_debug=master_query if debug else None,
         )
 
-    total = db.charger_master.count_documents(query)
-    cursor = (
-        db.charger_master
-        .find(query)
+    # ── 일반 경로: charger_master 단순 커서 ─────────────────────────────
+    total = db.charger_master.count_documents(master_query)
+    page_docs = list(
+        db.charger_master.find(master_query)
         .skip(req.skip)
         .limit(req.limit)
     )
-    results = [_to_result(doc, status_map) for doc in cursor]
+
+    # 현재 페이지 분량의 statId만 charger_current에서 조회
+    page_stat_ids = list({d["statId"] for d in page_docs if d.get("statId")})
+    status_map = _build_status_map(db, page_stat_ids)
+
+    results = _stat_sort([_to_result(doc, status_map) for doc in page_docs])
 
     return SearchResponse(
         results=results,
         total=total,
-        snapshot_bucket=target_bucket,
-        query_debug=query if debug else None,
+        snapshot_bucket=snapshot_bucket,
+        query_debug=master_query if debug else None,
     )

@@ -38,7 +38,7 @@ class SearchRequest(BaseModel):
     skip: int = Field(default=0, ge=0)
     at: datetime | None = Field(
         default=None,
-        description="조회 기준 시각 (ISO 8601). 이 시각 이전 가장 최근 수집 주기의 충전 상태를 사용합니다.",
+        description="조회 기준 시각 (ISO 8601). 현재는 최신 스냅샷을 사용합니다.",
     )
     query: str | None = Field(
         default=None,
