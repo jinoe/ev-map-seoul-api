@@ -1,6 +1,7 @@
 import re
 from collections import defaultdict
 from datetime import datetime, timedelta, timezone
+from functools import lru_cache
 from typing import Any, Optional
 
 from pymongo.database import Database
@@ -17,6 +18,44 @@ from app.schemas.stats import (
 )
 
 KST = timezone(timedelta(hours=9))
+
+GEOJSON_URL = (
+    "https://raw.githubusercontent.com/raqoon886/Local_HangJeongDong/master/"
+    "hangjeongdong_%EC%84%9C%EC%9A%B8%ED%8A%B9%EB%B3%84%EC%8B%9C.geojson"
+)
+
+@lru_cache(maxsize=1)
+def _get_seoul_geojson():
+    """서울시 행정동 GeoJSON 데이터를 로드하여 캐싱."""
+    try:
+        import httpx
+        with httpx.Client() as client:
+            resp = client.get(GEOJSON_URL)
+            return resp.json()
+    except Exception as e:
+        print(f"Failed to load GeoJSON: {e}")
+        return None
+
+def _is_point_in_polygon(lat: float, lng: float, polygon: list) -> bool:
+    """점(lat, lng)이 폴리곤 내부에 있는지 판별 (Ray-casting algorithm)."""
+    inside = False
+    for i in range(len(polygon)):
+        j = i - 1
+        xi, yi = polygon[i][0], polygon[i][1]
+        xj, yj = polygon[j][0], polygon[j][1]
+        if ((yi > lat) != (yj > lat)) and (lng < (xj - xi) * (lat - yi) / (yj - yi) + xi):
+            inside = not inside
+    return inside
+
+def _is_point_in_feature(lat: float, lng: float, geometry: dict) -> bool:
+    """MultiPolygon 및 Polygon 처리."""
+    g_type = geometry.get("type")
+    coords = geometry.get("coordinates", [])
+    if g_type == "Polygon":
+        return _is_point_in_polygon(lat, lng, coords[0])
+    if g_type == "MultiPolygon":
+        return any(_is_point_in_polygon(lat, lng, poly[0]) for poly in coords)
+    return False
 
 STATUS_MAP = {
     "0": "알수없음",
@@ -118,8 +157,6 @@ def _master_match(gu: str | None = None, dong: str | None = None) -> dict[str, A
     addr_conditions = []
     if gu:
         addr_conditions.append({"addr": {"$regex": re.escape(gu.strip())}})
-    if dong:
-        addr_conditions.append({"addr": {"$regex": re.escape(dong.strip())}})
     if len(addr_conditions) == 1:
         match.update(addr_conditions[0])
     elif len(addr_conditions) > 1:
@@ -226,6 +263,19 @@ def _current_rows(
         bucket = latest.get("collectedAtBucket") if latest else None
         status_docs = _status_docs_for_bucket(db, bucket)
 
+    # 동 필터가 있는 경우 해당 동의 Geometry 정보 찾기 (지도와 로직 일치)
+    target_geometry = None
+    if gu and dong:
+        geojson = _get_seoul_geojson()
+        if geojson:
+            for feature in geojson.get("features", []):
+                props = feature.get("properties", {})
+                f_gu = props.get("sggnm")
+                f_dong = props.get("adm_nm", "").split()[-1]
+                if f_gu == gu and f_dong == dong:
+                    target_geometry = feature.get("geometry")
+                    break
+
     projection = {
         "_id": 0,
         "statId": 1,
@@ -244,7 +294,17 @@ def _current_rows(
     }
 
     rows: list[dict[str, Any]] = []
-    for master in db.charger_master.find(_master_match(gu, dong), projection):
+    for master in db.charger_master.find(_master_match(gu=gu), projection):
+        # 좌표 기반 동 필터링 적용 (동 선택 시)
+        if target_geometry:
+            lat = master.get("lat")
+            lng = master.get("lng")
+            if lat is None or lng is None:
+                continue
+            # lat/lng 순서 주의 (GeoJSON은 [lng, lat], 연산은 lat, lng)
+            if not _is_point_in_feature(float(lat), float(lng), target_geometry):
+                continue
+
         stat_id = _normalize_text(master.get("statId"))
         chger_id = _normalize_text(master.get("chgerId"))
         status_doc = status_docs.get((stat_id, chger_id), {}) if stat_id and chger_id else {}
