@@ -68,7 +68,42 @@ STATUS_MAP = {
 }
 FAULT_STATUSES = {"1", "4", "5"}
 WEEKDAY_LABELS = ["월", "화", "수", "목", "금", "토", "일"]
-LONG_OCCUPANCY_THRESHOLD_MINUTES = 360
+FAST_LONG_OCCUPANCY_THRESHOLD_MINUTES = 60
+SLOW_LONG_OCCUPANCY_THRESHOLD_MINUTES = 14 * 60
+
+SLOW_CHARGER_TYPE_CODES = {"02", "08"}
+FAST_CHARGER_TYPE_CODES = {"01", "03", "04", "05", "06", "07", "09", "10"}
+
+def _charger_speed_type(row: dict[str, Any]) -> str:
+    """
+    장기 점유 기준 적용을 위한 충전기 속도 분류.
+    1순위: chgerType 코드
+    2순위: output 값 fallback
+    """
+    chger_type = _normalize_text(row.get("chgerType"))
+
+    if chger_type in SLOW_CHARGER_TYPE_CODES:
+        return "slow"
+
+    if chger_type in FAST_CHARGER_TYPE_CODES:
+        return "fast"
+
+    # 타입 코드가 없거나 알 수 없는 경우 output으로 보조 판단
+    output_value = safe_float(row.get("output"))
+    if output_value >= 50:
+        return "fast"
+
+    return "slow"
+
+
+def _long_occupancy_threshold_minutes(row: dict[str, Any]) -> int:
+    speed_type = _charger_speed_type(row)
+
+    if speed_type == "fast":
+        return FAST_LONG_OCCUPANCY_THRESHOLD_MINUTES
+
+    return SLOW_LONG_OCCUPANCY_THRESHOLD_MINUTES
+
 
 
 def _as_utc_naive(dt: datetime | None) -> datetime | None:
@@ -344,7 +379,10 @@ def _long_occupancy_item(row: dict[str, Any], latest: dict | None) -> LongOccupa
     if not started_at:
         return None
     duration = int((_reference_kst(latest) - started_at).total_seconds() // 60)
-    if duration < LONG_OCCUPANCY_THRESHOLD_MINUTES:
+
+    threshold_minutes = _long_occupancy_threshold_minutes(row)
+
+    if duration < threshold_minutes:
         return None
     return LongOccupancyItem(
         statId=row.get("statId"),
@@ -447,7 +485,11 @@ def _overview_from_rows(
         maxOutput=max(outputs) if outputs else 0,
         longOccupancy=LongOccupancyStats(
             count=len(long_occupancy_items),
-            thresholdMinutes=LONG_OCCUPANCY_THRESHOLD_MINUTES,
+            thresholdMinutes=None,
+            thresholdMinutesByType={
+                "급속": FAST_LONG_OCCUPANCY_THRESHOLD_MINUTES,
+                "완속": SLOW_LONG_OCCUPANCY_THRESHOLD_MINUTES,
+            },
             items=long_occupancy_items[:20],
         ),
         statusDistribution=dict(status_distribution),

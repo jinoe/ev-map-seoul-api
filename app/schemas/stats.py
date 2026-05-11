@@ -45,7 +45,8 @@ class LongOccupancyItem(BaseModel):
 
 class LongOccupancyStats(BaseModel):
     count: int
-    thresholdMinutes: int
+    thresholdMinutes: int | None = None
+    thresholdMinutesByType: dict[str, int] | None = None
     items: list[LongOccupancyItem]
 
 
