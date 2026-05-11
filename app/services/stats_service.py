@@ -175,15 +175,56 @@ def _status_docs_for_bucket(db: Database, bucket: datetime | None) -> dict[tuple
     return result
 
 
+def _current_status_from_current(db: Database) -> dict[tuple[str, str], dict[str, Any]]:
+    """charger_current 컬렉션에서 모든 충전기의 최신 상태를 가져옴."""
+    cursor = db.charger_current.find(
+        {},
+        {
+            "_id": 0,
+            "statId": 1,
+            "chgerId": 1,
+            "stat": 1,
+            "statUpdDt": 1,
+            "updatedAt": 1,
+            "lastObservedAt": 1,
+            "raw": 1,
+        },
+    )
+    result: dict[tuple[str, str], dict[str, Any]] = {}
+    for doc in cursor:
+        stat_id = _normalize_text(doc.get("statId"))
+        chger_id = _normalize_text(doc.get("chgerId"))
+        if stat_id and chger_id:
+            result[(stat_id, chger_id)] = doc
+    return result
+
+
 def _current_rows(
     db: Database,
     gu: str | None = None,
     dong: str | None = None,
     at: datetime | None = None,
 ) -> tuple[list[dict[str, Any]], Optional[dict], dict[tuple[str, str], dict[str, Any]]]:
-    latest = get_latest_bucket(db, at)
-    bucket = latest.get("collectedAtBucket") if latest else None
-    status_docs = _status_docs_for_bucket(db, bucket)
+    # --- 기존 스냅샷 방식 (주석 처리) ---
+    # latest = get_latest_bucket(db, at)
+    # bucket = latest.get("collectedAtBucket") if latest else None
+    # status_docs = _status_docs_for_bucket(db, bucket)
+    # --------------------------------
+
+    if at is None:
+        # 실시간: charger_current 사용
+        status_docs = _current_status_from_current(db)
+        # 최신 업데이트 시각 산출을 위해 가상의 latest 객체 생성
+        latest_doc = db.charger_current.find_one({}, sort=[("updatedAt", -1)])
+        latest = {
+            "collectedAt": latest_doc.get("updatedAt") if latest_doc else datetime.now(timezone.utc),
+            "collectedAtKst": latest_doc.get("lastObservedAtKst") if latest_doc else None
+        }
+    else:
+        # 과거 시점 조회: 기존 스냅샷 방식 사용
+        latest = get_latest_bucket(db, at)
+        bucket = latest.get("collectedAtBucket") if latest else None
+        status_docs = _status_docs_for_bucket(db, bucket)
 
     projection = {
         "_id": 0,
@@ -356,19 +397,33 @@ def _overview_from_rows(
 
 
 def get_stats_summary(db: Database) -> Optional[StatsSummaryResponse]:
-    latest = get_latest_bucket(db)
-    if not latest:
-        return None
+    # --- 기존 스냅샷 방식 (주석 처리) ---
+    # latest = get_latest_bucket(db)
+    # if not latest:
+    #     return None
+    # bucket = latest.get("collectedAtBucket")
+    # pipeline = [
+    #     {"$match": {"collectedAtBucket": bucket}},
+    #     {"$group": {"_id": "$stat", "count": {"$sum": 1}}},
+    # ]
+    # status_counts_raw = {
+    #     str(doc.get("_id") or "0"): doc.get("count", 0)
+    #     for doc in db.charger_status_snapshot.aggregate(pipeline)
+    # }
+    # --------------------------------
 
-    bucket = latest.get("collectedAtBucket")
+    # charger_current 기반 실시간 집계
     pipeline = [
-        {"$match": {"collectedAtBucket": bucket}},
         {"$group": {"_id": "$stat", "count": {"$sum": 1}}},
     ]
     status_counts_raw = {
         str(doc.get("_id") or "0"): doc.get("count", 0)
-        for doc in db.charger_status_snapshot.aggregate(pipeline)
+        for doc in db.charger_current.aggregate(pipeline)
     }
+    
+    latest_doc = db.charger_current.find_one({}, sort=[("updatedAt", -1)])
+    if not latest_doc:
+        return None
 
     total_chargers = sum(status_counts_raw.values())
     available_count = status_counts_raw.get("2", 0)
@@ -386,9 +441,9 @@ def get_stats_summary(db: Database) -> Optional[StatsSummaryResponse]:
         faultCount=fault_count,
         unknownCount=unknown_count,
         availabilityRate=round((available_count / total_chargers * 100), 2) if total_chargers else 0,
-        generatedAt=latest.get("collectedAt"),
-        generatedAtKst=_iso_kst(latest.get("collectedAt"), latest.get("collectedAtKst")),
-        collectedAtBucket=bucket.isoformat() if hasattr(bucket, "isoformat") else str(bucket),
+        generatedAt=latest_doc.get("updatedAt"),
+        generatedAtKst=_iso_kst(latest_doc.get("updatedAt"), latest_doc.get("lastObservedAtKst")),
+        collectedAtBucket=latest_doc.get("lastSnapshotBucket").isoformat() if latest_doc.get("lastSnapshotBucket") else None,
     )
 
 
