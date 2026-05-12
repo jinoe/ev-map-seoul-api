@@ -99,9 +99,32 @@ _FACILITY_KIND_MAP: dict[str, str] = {
 }
 
 
-def _facility_label_for_dashboard(raw_key: str) -> str:
-    v = (raw_key or "").strip()
-    return _FACILITY_KIND_MAP.get(v, v) or "기타"
+# charger_master.kind 에 저장되는 실제 2자리 숫자 코드 (한국환경공단 API kind 필드)
+_FACILITY_NUMERIC_MAP: dict[str, str] = {
+    "01": "주차장",
+    "02": "공동주택",
+    "03": "주거시설",
+    "04": "상업시설",
+    "05": "업무시설",
+    "06": "산업시설",
+    "07": "의료시설",
+    "08": "교육시설",
+    "09": "문화/관광",
+    "10": "기타",
+}
+
+
+def _facility_label_for_dashboard(kind: str | None, kind_detail: str | None = None) -> str:
+    """kindDetail(텍스트 또는 A001-J007) → kind("01"-"10") 순으로 한글 레이블 반환."""
+    for val in (kind_detail, kind):
+        v = (val or "").strip()
+        if v in _FACILITY_KIND_MAP:
+            return _FACILITY_KIND_MAP[v]
+        if v in _FACILITY_NUMERIC_MAP:
+            return _FACILITY_NUMERIC_MAP[v]
+        if v:
+            return v
+    return "기타"
 FAST_LONG_OCCUPANCY_THRESHOLD_MINUTES = 60
 SLOW_LONG_OCCUPANCY_THRESHOLD_MINUTES = 14 * 60
 # 삭제
@@ -559,8 +582,8 @@ def _overview_from_rows(
         if output_value > 0:
             outputs.append(output_value)
 
-        facility_key = row.get("kind") or row.get("kindDetail") or "기타"
-        facility_distribution[str(facility_key)] += 1
+        facility_key = _facility_label_for_dashboard(row.get("kind"), row.get("kindDetail"))
+        facility_distribution[facility_key] += 1
 
         item = _long_occupancy_item(row, latest)
         if item:
@@ -833,6 +856,31 @@ def _status_history_rows(db: Database, latest: dict | None, days: int = 7) -> li
     return list(cursor)
 
 
+def _status_history_rows_for_stat_ids(
+    db: Database,
+    stat_ids: list[str],
+    days: int = 7,
+) -> list[dict[str, Any]]:
+    """구/동 범위 충전소 ID 목록에 대한 히스토리 스냅샷 조회."""
+    latest_snap = db.charger_status_snapshot.find_one(
+        {},
+        sort=[("collectedAtBucket", -1)],
+        projection={"collectedAtBucket": 1},
+    )
+    if not latest_snap or not latest_snap.get("collectedAtBucket"):
+        return []
+    end = latest_snap["collectedAtBucket"]
+    start = end - timedelta(days=days)
+    cursor = db.charger_status_snapshot.find(
+        {
+            "collectedAtBucket": {"$gte": start, "$lte": end},
+            "statId": {"$in": stat_ids},
+        },
+        {"_id": 0, "stat": 1, "collectedAtBucket": 1},
+    )
+    return list(cursor)
+
+
 def _availability_by_weekday(history: list[dict[str, Any]]) -> list[dict[str, Any]]:
     grouped: dict[int, dict[str, int]] = defaultdict(lambda: {"total": 0, "available": 0})
     for row in history:
@@ -961,12 +1009,16 @@ def get_dashboard_stats(
     # Fallback: 캐시 없을 때 또는 구/동 필터/과거 시점 조회
     rows, latest, _ = _current_rows(db, gu=gu, dong=dong, at=at)
     overview = _overview_from_rows(rows, latest, gu=gu, dong=dong)
-    history = _status_history_rows(db, latest, days=7) if not gu and not dong else []
+    if gu or dong:
+        stat_ids = list({row.get("statId") for row in rows if row.get("statId")})
+        history = _status_history_rows_for_stat_ids(db, stat_ids, days=7)
+    else:
+        history = _status_history_rows(db, latest, days=7)
 
     total_facility = sum(overview.facilityDistribution.values()) or 1
     facility_type_distribution = [
         {
-            "type": _facility_label_for_dashboard(name),
+            "type": name,
             "count": value,
             "ratio": round(value / total_facility * 100, 2),
         }
