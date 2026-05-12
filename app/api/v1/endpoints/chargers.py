@@ -1,8 +1,8 @@
-from fastapi import APIRouter, Depends, Query
+from fastapi import APIRouter, Depends, HTTPException, Query
 from pymongo.database import Database
 
 from app.db.mongodb import get_db
-from app.schemas.charger import DistrictListResponse, StationListResponse
+from app.schemas.charger import DistrictListResponse, StationDetailResponse, StationListResponse
 from app.services import charger_service
 
 router = APIRouter()
@@ -21,3 +21,11 @@ def list_chargers(
 @router.get("/districts", response_model=DistrictListResponse)
 def list_districts(db: Database = Depends(get_db)):
     return charger_service.get_districts(db)
+
+
+@router.get("/{stat_id}", response_model=StationDetailResponse)
+def get_station_detail(stat_id: str, db: Database = Depends(get_db)):
+    result = charger_service.get_station_detail(db, stat_id)
+    if not result:
+        raise HTTPException(status_code=404, detail="Station not found")
+    return result
