@@ -212,6 +212,22 @@ def _master_match(gu: str | None = None, dong: str | None = None) -> dict[str, A
     return match
 
 
+def _make_scope_key(type_: str, gu: str | None = None, dong: str | None = None) -> str:
+    if not gu:
+        return "city"
+    if type_ == "dongs" or not dong:
+        return f"gu:{gu}"
+    return f"dong:{gu}:{dong}"
+
+
+def _load_stats_cache(db: Database, type_: str, scope_key: str) -> dict | None:
+    doc = db.charger_stats_cache.find_one(
+        {"type": type_, "scopeKey": scope_key},
+        {"_id": 0, "payload": 1},
+    )
+    return doc.get("payload") if doc else None
+
+
 def get_latest_bucket(db: Database, at: datetime | None = None) -> Optional[dict]:
     """기준 시각 이전의 가장 최근 상태 스냅샷 문서 1개를 반환."""
     query: dict[str, Any] = {}
@@ -560,6 +576,13 @@ def _overview_from_rows(
 
 
 def get_stats_summary(db: Database) -> Optional[StatsSummaryResponse]:
+    cached = _load_stats_cache(db, "summary", "city")
+    if cached:
+        try:
+            return StatsSummaryResponse(**cached)
+        except Exception:
+            pass
+
     # --- 기존 스냅샷 방식 (주석 처리) ---
     # latest = get_latest_bucket(db)
     # if not latest:
@@ -623,9 +646,21 @@ def get_stats_overview(
 
     ttl = 90 if (gu or dong) else 120
     cache_key = f"overview:{gu or ''}:{dong or ''}"
-    cached = _cache.get(cache_key, ttl=ttl)
-    if cached is not None:
-        return cached
+    mem_cached = _cache.get(cache_key, ttl=ttl)
+    if mem_cached is not None:
+        return mem_cached
+
+    # dong-level stats are not precomputed (requires geo lookup); skip cache for those
+    if not dong:
+        scope_key = _make_scope_key("overview", gu=gu)
+        db_cached = _load_stats_cache(db, "overview", scope_key)
+        if db_cached:
+            try:
+                result = StatsOverviewResponse(**db_cached)
+                _cache.set(cache_key, result)
+                return result
+            except Exception:
+                pass
 
     rows, latest, _ = _current_rows(db, gu=gu, dong=dong)
     result = _overview_from_rows(rows, latest, gu=gu, dong=dong)
@@ -668,6 +703,14 @@ def _group_current_rows(rows: list[dict[str, Any]], group_key: str) -> list[dict
 
 
 def get_districts_stats(db: Database, at: datetime | None = None) -> list[DistrictStatItem]:
+    if at is None:
+        db_cached = _load_stats_cache(db, "districts", "city")
+        if db_cached:
+            try:
+                return [DistrictStatItem(**item) for item in db_cached.get("items", [])]
+            except Exception:
+                pass
+
     rows, _, _ = _current_rows(db, at=at)
     return [
         DistrictStatItem(
@@ -689,6 +732,14 @@ def get_districts_stats(db: Database, at: datetime | None = None) -> list[Distri
 
 
 def get_dongs_stats(db: Database, gu: str, at: datetime | None = None) -> list[DongStatItem]:
+    if at is None:
+        db_cached = _load_stats_cache(db, "dongs", f"gu:{gu}")
+        if db_cached:
+            try:
+                return [DongStatItem(**item) for item in db_cached.get("items", [])]
+            except Exception:
+                pass
+
     rows, _, _ = _current_rows(db, gu=gu, at=at)
     return [
         DongStatItem(
