@@ -69,6 +69,39 @@ STATUS_MAP = {
 }
 FAULT_STATUSES = {"1", "4", "5"}
 WEEKDAY_LABELS = ["월", "화", "수", "목", "금", "토", "일"]
+
+_FACILITY_KIND_MAP: dict[str, str] = {
+    # A: 공공기관
+    "A001": "관공서", "A002": "주민센터", "A003": "공공기관", "A004": "지자체시설",
+    # B: 주차장
+    "B001": "공영주차장", "B002": "공원주차장", "B003": "환승주차장", "B004": "일반주차장",
+    # C: 휴게소
+    "C001": "고속도로 휴게소", "C002": "지방도로 휴게소", "C003": "쉼터",
+    # D: 관광/문화
+    "D001": "공원", "D002": "전시관", "D003": "민속마을", "D004": "생태공원",
+    "D005": "홍보관", "D006": "관광안내소", "D007": "관광지", "D008": "박물관", "D009": "유적지",
+    # E: 상업시설
+    "E001": "마트/쇼핑몰", "E002": "백화점", "E003": "숙박시설", "E004": "골프장",
+    "E005": "카페", "E006": "음식점", "E007": "주유소", "E008": "영화관",
+    # F: 자동차 관련
+    "F001": "서비스센터", "F002": "정비소",
+    # G: 기타
+    "G001": "군부대", "G002": "야영장", "G003": "공중전화부스", "G004": "기타",
+    "G005": "오피스텔", "G006": "단독주택",
+    # H: 주거시설
+    "H001": "아파트", "H002": "빌라", "H003": "사업장(사옥)", "H004": "기숙사", "H005": "연립주택",
+    # I: 의료/복지
+    "I001": "병원", "I002": "종교시설", "I003": "보건소", "I004": "경찰서",
+    "I005": "도서관", "I006": "복지관", "I007": "수련원", "I008": "금융기관",
+    # J: 교육/문화시설
+    "J001": "학교", "J002": "교육원", "J003": "학원", "J004": "공연장",
+    "J005": "관람장", "J006": "동식물원", "J007": "경기장",
+}
+
+
+def _facility_label_for_dashboard(raw_key: str) -> str:
+    v = (raw_key or "").strip()
+    return _FACILITY_KIND_MAP.get(v, v) or "기타"
 FAST_LONG_OCCUPANCY_THRESHOLD_MINUTES = 60
 SLOW_LONG_OCCUPANCY_THRESHOLD_MINUTES = 14 * 60
 # 삭제
@@ -907,12 +940,36 @@ def get_dashboard_stats(
     dong: str | None = None,
     at: datetime | None = None,
 ) -> DashboardStatsResponse:
+    # 도시 전체 실시간 조회: 스케줄러가 미리 계산한 캐시를 우선 반환
+    if not gu and not dong and at is None:
+        cached = _load_stats_cache(db, "dashboard", "city")
+        if cached:
+            return DashboardStatsResponse(
+                kpis=cached.get("kpis", {}),
+                manufacturerFaultRate=cached.get("manufacturerFaultRate", []),
+                installYearFaultRate=cached.get("installYearFaultRate", []),
+                availabilityByWeekday=cached.get("availabilityByWeekday", []),
+                availabilityHeatmap=cached.get("availabilityHeatmap", []),
+                weekdayWeekendHourlyUsage=cached.get("weekdayWeekendHourlyUsage", []),
+                facilityTypeDistribution=cached.get("facilityTypeDistribution", []),
+                facilityTypeCounts=cached.get("facilityTypeDistribution", []),
+                faultTrend=cached.get("faultTrend", []),
+                longOccupancyTrend=[],
+                districtRanking=cached.get("districtRanking", []),
+            )
+
+    # Fallback: 캐시 없을 때 또는 구/동 필터/과거 시점 조회
     rows, latest, _ = _current_rows(db, gu=gu, dong=dong, at=at)
     overview = _overview_from_rows(rows, latest, gu=gu, dong=dong)
     history = _status_history_rows(db, latest, days=7) if not gu and not dong else []
 
+    total_facility = sum(overview.facilityDistribution.values()) or 1
     facility_type_distribution = [
-        {"name": name, "value": value}
+        {
+            "type": _facility_label_for_dashboard(name),
+            "count": value,
+            "ratio": round(value / total_facility * 100, 2),
+        }
         for name, value in sorted(overview.facilityDistribution.items(), key=lambda kv: -kv[1])
     ]
     district_ranking = [item.model_dump() for item in get_districts_stats(db, at=at)[:10]] if not gu and not dong else []
