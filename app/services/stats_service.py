@@ -70,6 +70,12 @@ FAULT_STATUSES = {"1", "4", "5"}
 WEEKDAY_LABELS = ["월", "화", "수", "목", "금", "토", "일"]
 FAST_LONG_OCCUPANCY_THRESHOLD_MINUTES = 60
 SLOW_LONG_OCCUPANCY_THRESHOLD_MINUTES = 14 * 60
+# 삭제
+# MAX_LONG_OCCUPANCY_MINUTES = 7 * 24 * 60  # 7일 초과는 데이터 오류로 간주
+  
+# 추가
+FAST_MAX_OCCUPANCY_MINUTES = 4 * 60    # 240분 초과 시 통신이상으로 간주
+SLOW_MAX_OCCUPANCY_MINUTES = 24 * 60   # 1440분 초과 시 통신이상으로 간주
 
 SLOW_CHARGER_TYPE_CODES = {"02", "08"}
 FAST_CHARGER_TYPE_CODES = {"01", "03", "04", "05", "06", "07", "09", "10"}
@@ -103,6 +109,12 @@ def _long_occupancy_threshold_minutes(row: dict[str, Any]) -> int:
         return FAST_LONG_OCCUPANCY_THRESHOLD_MINUTES
 
     return SLOW_LONG_OCCUPANCY_THRESHOLD_MINUTES
+
+def _long_occupancy_max_minutes(row: dict[str, Any]) -> int:
+      speed_type = _charger_speed_type(row)
+      if speed_type == "fast":
+          return FAST_MAX_OCCUPANCY_MINUTES
+      return SLOW_MAX_OCCUPANCY_MINUTES
 
 
 
@@ -371,18 +383,53 @@ def _reference_kst(latest: dict | None) -> datetime:
     return datetime.now(KST)
 
 
+# def _long_occupancy_item(row: dict[str, Any], latest: dict | None) -> LongOccupancyItem | None:
+#     if row.get("stat") != "3":
+#         return None
+#     status_doc = row.get("statusDoc") or {}
+#     started_at = _parse_kst_compact_datetime(_get_status_ts(status_doc, "nowTsdt"))
+#     if not started_at:
+#         return None
+#     duration = int((_reference_kst(latest) - started_at).total_seconds() // 60)
+
+#     threshold_minutes = _long_occupancy_threshold_minutes(row)
+
+#     if duration < threshold_minutes or duration > MAX_LONG_OCCUPANCY_MINUTES:
+#         return None
+#     return LongOccupancyItem(
+#         statId=row.get("statId"),
+#         chgerId=row.get("chgerId"),
+#         statNm=row.get("statNm"),
+#         addr=row.get("addr"),
+#         gu=extract_gu(row.get("addr")),
+#         dong=extract_dong(row.get("addr")),
+#         output=row.get("output"),
+#         nowTsdt=_get_status_ts(status_doc, "nowTsdt"),
+#         durationMinutes=max(duration, 0),
+#         lat=row.get("lat"),
+#         lng=row.get("lng"),
+#     )
+
 def _long_occupancy_item(row: dict[str, Any], latest: dict | None) -> LongOccupancyItem | None:
     if row.get("stat") != "3":
         return None
     status_doc = row.get("statusDoc") or {}
+    
+    # 조건 1: lastTedt > lastTsdt → 충전 종료됐으나 상태 미갱신 (통신이상)
+    last_tsdt = _parse_kst_compact_datetime(_get_status_ts(status_doc, "lastTsdt"))
+    last_tedt = _parse_kst_compact_datetime(_get_status_ts(status_doc, "lastTedt"))
+    if last_tsdt and last_tedt and last_tedt > last_tsdt:
+        return None
+        
     started_at = _parse_kst_compact_datetime(_get_status_ts(status_doc, "nowTsdt"))
     if not started_at:
         return None
     duration = int((_reference_kst(latest) - started_at).total_seconds() // 60)
-
+    
     threshold_minutes = _long_occupancy_threshold_minutes(row)
-
-    if duration < threshold_minutes:
+    max_minutes = _long_occupancy_max_minutes(row)
+    
+    if duration < threshold_minutes or duration > max_minutes:
         return None
     return LongOccupancyItem(
         statId=row.get("statId"),
@@ -392,12 +439,12 @@ def _long_occupancy_item(row: dict[str, Any], latest: dict | None) -> LongOccupa
         gu=extract_gu(row.get("addr")),
         dong=extract_dong(row.get("addr")),
         output=row.get("output"),
+        speedType=_charger_speed_type(row),
         nowTsdt=_get_status_ts(status_doc, "nowTsdt"),
         durationMinutes=max(duration, 0),
         lat=row.get("lat"),
         lng=row.get("lng"),
     )
-
 
 def _overview_from_rows(
     rows: list[dict[str, Any]],
@@ -465,6 +512,9 @@ def _overview_from_rows(
 
     long_occupancy_items.sort(key=lambda item: item.durationMinutes, reverse=True)
 
+    fast_items = [i for i in long_occupancy_items if i.speedType == "fast"]
+    slow_items = [i for i in long_occupancy_items if i.speedType == "slow"]
+
     return StatsOverviewResponse(
         scope=ScopeInfo(gu=gu, dong=dong),
         updatedAt=_iso_kst(latest.get("collectedAt") if latest else None, latest.get("collectedAtKst") if latest else None),
@@ -485,12 +535,16 @@ def _overview_from_rows(
         maxOutput=max(outputs) if outputs else 0,
         longOccupancy=LongOccupancyStats(
             count=len(long_occupancy_items),
+            fastCount=len(fast_items),
+            slowCount=len(slow_items),
             thresholdMinutes=None,
             thresholdMinutesByType={
                 "급속": FAST_LONG_OCCUPANCY_THRESHOLD_MINUTES,
                 "완속": SLOW_LONG_OCCUPANCY_THRESHOLD_MINUTES,
             },
             items=long_occupancy_items[:20],
+            fastItems=fast_items[:20],
+            slowItems=slow_items[:20],
         ),
         statusDistribution=dict(status_distribution),
         chargerTypeDistribution=dict(charger_type_distribution),

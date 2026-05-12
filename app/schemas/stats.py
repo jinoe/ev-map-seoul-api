@@ -37,6 +37,7 @@ class LongOccupancyItem(BaseModel):
     gu: str | None = None
     dong: str | None = None
     output: str | None = None
+    speedType: str | None = None  # "fast" | "slow"
     nowTsdt: str | None = None
     durationMinutes: int
     lat: float | None = None
@@ -45,9 +46,13 @@ class LongOccupancyItem(BaseModel):
 
 class LongOccupancyStats(BaseModel):
     count: int
+    fastCount: int = 0
+    slowCount: int = 0
     thresholdMinutes: int | None = None
     thresholdMinutesByType: dict[str, int] | None = None
     items: list[LongOccupancyItem]
+    fastItems: list[LongOccupancyItem] = []
+    slowItems: list[LongOccupancyItem] = []
 
 
 class StatsOverviewResponse(BaseModel):
