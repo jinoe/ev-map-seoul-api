@@ -3,6 +3,8 @@ from datetime import datetime, timedelta, timezone
 
 from pymongo.database import Database
 
+from app.core import cache as _cache
+
 from app.schemas.charger import (
     ChargerDetailItem,
     ChargerInfo,
@@ -79,17 +81,19 @@ def _extract_gu(addr: str | None) -> str | None:
 
 
 def _build_status_map(db: Database) -> dict[tuple[str, str], str]:
-    latest = db.charger_status_snapshot.find_one(sort=[("collectedAtBucket", -1), ("collectedAt", -1)])
-    if not latest:
-        return {}
-    bucket = latest["collectedAtBucket"]
-    return {
+    cached = _cache.get("charger_status_map", ttl=90)
+    if cached is not None:
+        return cached
+    result = {
         (s["statId"], s["chgerId"]): s.get("stat") or ""
-        for s in db.charger_status_snapshot.find(
-            {"collectedAtBucket": bucket},
-            {"statId": 1, "chgerId": 1, "stat": 1, "_id": 0},
+        for s in db.charger_current.find(
+            {},
+            {"_id": 0, "statId": 1, "chgerId": 1, "stat": 1},
         )
+        if s.get("statId") and s.get("chgerId")
     }
+    _cache.set("charger_status_map", result)
+    return result
 
 
 def get_stations(

@@ -6,6 +6,7 @@ from typing import Any, Optional
 
 from pymongo.database import Database
 
+from app.core import cache as _cache
 from app.schemas.stats import (
     DashboardStatsResponse,
     DistrictStatItem,
@@ -260,7 +261,11 @@ def _status_docs_for_bucket(db: Database, bucket: datetime | None) -> dict[tuple
 
 
 def _current_status_from_current(db: Database) -> dict[tuple[str, str], dict[str, Any]]:
-    """charger_current 컬렉션에서 모든 충전기의 최신 상태를 가져옴."""
+    """charger_current 컬렉션에서 모든 충전기의 최신 상태를 가져옴. 90초 TTL 캐시."""
+    cached = _cache.get("status_docs", ttl=90)
+    if cached is not None:
+        return cached
+
     cursor = db.charger_current.find(
         {},
         {
@@ -269,9 +274,11 @@ def _current_status_from_current(db: Database) -> dict[tuple[str, str], dict[str
             "chgerId": 1,
             "stat": 1,
             "statUpdDt": 1,
-            "updatedAt": 1,
-            "lastObservedAt": 1,
-            "raw": 1,
+            "raw.stat": 1,
+            "raw.statUpdDt": 1,
+            "raw.nowTsdt": 1,
+            "raw.lastTsdt": 1,
+            "raw.lastTedt": 1,
         },
     )
     result: dict[tuple[str, str], dict[str, Any]] = {}
@@ -280,6 +287,8 @@ def _current_status_from_current(db: Database) -> dict[tuple[str, str], dict[str
         chger_id = _normalize_text(doc.get("chgerId"))
         if stat_id and chger_id:
             result[(stat_id, chger_id)] = doc
+
+    _cache.set("status_docs", result)
     return result
 
 
@@ -335,9 +344,8 @@ def _current_rows(
         "output": 1,
         "kind": 1,
         "kindDetail": 1,
-        "busiNm": 1,
-        "busiId": 1,
-        "raw": 1,
+        "raw.maker": 1,
+        "raw.year": 1,
     }
 
     rows: list[dict[str, Any]] = []
@@ -502,8 +510,7 @@ def _overview_from_rows(
         if output_value > 0:
             outputs.append(output_value)
 
-        raw = row.get("raw") or {}
-        facility_key = row.get("kind") or raw.get("kind") or row.get("kindDetail") or raw.get("kindDetail") or "기타"
+        facility_key = row.get("kind") or row.get("kindDetail") or "기타"
         facility_distribution[str(facility_key)] += 1
 
         item = _long_occupancy_item(row, latest)
@@ -609,8 +616,21 @@ def get_stats_overview(
     dong: str | None = None,
     at: datetime | None = None,
 ) -> StatsOverviewResponse:
-    rows, latest, _ = _current_rows(db, gu=gu, dong=dong, at=at)
-    return _overview_from_rows(rows, latest, gu=gu, dong=dong)
+    # 과거 시점 조회는 캐시 안 함
+    if at is not None:
+        rows, latest, _ = _current_rows(db, gu=gu, dong=dong, at=at)
+        return _overview_from_rows(rows, latest, gu=gu, dong=dong)
+
+    ttl = 90 if (gu or dong) else 120
+    cache_key = f"overview:{gu or ''}:{dong or ''}"
+    cached = _cache.get(cache_key, ttl=ttl)
+    if cached is not None:
+        return cached
+
+    rows, latest, _ = _current_rows(db, gu=gu, dong=dong)
+    result = _overview_from_rows(rows, latest, gu=gu, dong=dong)
+    _cache.set(cache_key, result)
+    return result
 
 
 def _group_current_rows(rows: list[dict[str, Any]], group_key: str) -> list[dict[str, Any]]:
